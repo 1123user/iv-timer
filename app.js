@@ -710,9 +710,16 @@
     const now = Date.now();
     const elapsed = elapsedMs(task, now);
     const over = Math.max(0, elapsed - task.expectedMin * 60 * 1000);
+    const isTest = task.id === TEST_ALARM_ID;
     root.hidden = false;
     $('#alarm-title').textContent = task.label;
-    $('#alarm-sub').textContent = '参考时长 ' + task.expectedMin + ' 分钟 · 到点提醒';
+    $('#alarm-sub').textContent = isTest
+      ? '响铃测试 · 戴耳机确认能听到声音'
+      : '参考时长 ' + task.expectedMin + ' 分钟 · 到点提醒';
+    const times = $('.alarm-times', root);
+    if (times) times.hidden = isTest;
+    const icsBtn = $('#alarm-ics');
+    if (icsBtn) icsBtn.hidden = isTest;
     $('#alarm-elapsed').textContent = fmtDuration(elapsed);
     $('#alarm-over').textContent = over > 0 ? fmtDuration(over) : '00:00';
     const s = ALARM_SOUNDS[alarmPref().sound] || ALARM_SOUNDS.classic;
@@ -721,10 +728,7 @@
 
   function nextAlarm() {
     // 只响「仍在输液」的任务，避免排队的任务已被结束/删除后还响
-    alarm.list = alarm.list.filter((t) => {
-      const live = state.tasks.find((x) => x.id === t.id);
-      return !!live && live.status === 'running';
-    });
+    alarm.list = alarm.list.filter((t) => isLiveAlarmTask(t.id));
     alarm.current = alarm.list.shift() || null;
     if (!alarm.current) {
       stopRing();
@@ -798,6 +802,59 @@
     alarm.list = alarm.list.filter((t) => t.id !== id);
     alarm.snooze.delete(id);
     if (alarm.current && alarm.current.id === id) stopAlarm();
+  }
+
+  /* ---------------- 响铃测试（戴耳机自测用） ---------------- */
+
+  const TEST_ALARM_ID = '__test_ring__';
+
+  /** 响铃是否有效：测试响铃放行，其余必须是"仍在输液"的任务 */
+  function isLiveAlarmTask(id) {
+    if (id === TEST_ALARM_ID) return true;
+    const live = state.tasks.find((x) => x.id === id);
+    return !!live && live.status === 'running';
+  }
+
+  /** 立即响铃（10 秒后自动停，可点「停止响铃」提前结束） */
+  function testRing() {
+    closePicker(true);
+    keepAllowed = true;
+    const pref = alarmPref();
+    alarm.volume = pref.volume;
+    stopAlarm();
+    alarm.list = [];
+    alarm.current = { id: TEST_ALARM_ID, label: '响铃测试', expectedMin: 1, startTs: Date.now() };
+    startRing(pref.sound);
+    startVibe();
+    acquireWakeLock();
+    renderAlarmPanel();
+    if (alarm.stopTimer) window.clearTimeout(alarm.stopTimer);
+    alarm.stopTimer = window.setTimeout(stopAlarm, 10000);
+  }
+
+  /** 模拟一瓶药：立即开始计时，seconds 秒后走完整响铃流程（提前提醒已静默） */
+  function simulateAlarm(seconds) {
+    const label = nextLabel('模拟药品');
+    const task = addTask({
+      label: label,
+      manufacturer: '',
+      totalMl: 100,
+      dripFactor: 20,
+      expectedMin: Math.max(0.1, seconds / 60),
+      alertMin: 1,
+    });
+    const started = advance(task.id, 'start');
+    if (!started) {
+      showToast('模拟失败，请重试');
+      return;
+    }
+    unmarkRinged(started.id);
+    state.alerted.add('pre:' + started.id); // 跳过开始瞬间的提前提醒
+    reload();
+    renderMonitor();
+    keepAllowed = true;
+    syncKeepAlive();
+    showToast('已模拟：' + seconds + ' 秒后自动响铃（' + label + '）', true);
   }
 
   /* ============================================================
@@ -905,6 +962,10 @@
       (alertReady() ? '试听铃声' : '开启响铃与通知') +
       '</button>' +
       '<p class="set-hint">响铃在页面打开时最可靠（已加静音保活，切后台/锁屏仍会响）；彻底关掉网页时用下面的远程推送兜底。</p>' +
+      '<div class="set-actions">' +
+      '<button type="button" class="modal-btn" data-set="ring-now">立即响铃测试</button>' +
+      '<button type="button" class="modal-btn" data-set="sim-30">模拟 30 秒后到点</button>' +
+      '</div>' +
       '<div class="set-row"><span>远程推送 · ntfy.sh</span><b id="set-ntfy-state">' + (cfg.enabled ? '已开启' : '未开启') + '</b></div>' +
       '<label class="set-label" for="set-topic">topic（手机 ntfy App 订阅同一个）</label>' +
       '<input class="set-input" id="set-topic" type="text" spellcheck="false" autocomplete="off" value="' + esc(topic) + '" />' +
@@ -939,6 +1000,10 @@
       const act = btn.getAttribute('data-set');
 
       if (act === 'close') { close(); return; }
+
+      if (act === 'ring-now') { close(); testRing(); return; }
+
+      if (act === 'sim-30') { close(); simulateAlarm(30); return; }
 
       if (act === 'enable') {
         await enableAlert();
@@ -1075,14 +1140,8 @@
     }
 
     // 兜底：已结束 / 已删除的任务不应保留响铃或排队
-    alarm.list = alarm.list.filter((t) => {
-      const live = state.tasks.find((x) => x.id === t.id);
-      return !!live && live.status === 'running';
-    });
-    if (alarm.current) {
-      const live = state.tasks.find((x) => x.id === alarm.current.id);
-      if (!live || live.status !== 'running') stopAlarm();
-    }
+    alarm.list = alarm.list.filter((t) => isLiveAlarmTask(t.id));
+    if (alarm.current && !isLiveAlarmTask(alarm.current.id)) stopAlarm();
 
     updateLive();
   }
@@ -1947,8 +2006,7 @@
 
     // 正在响铃的任务若已结束或被删除 → 立刻停响（绝不留残留铃声）
     if (alarm.current) {
-      const live = state.tasks.find((x) => x.id === alarm.current.id);
-      if (!live || live.status !== 'running') stopAlarm();
+      if (!isLiveAlarmTask(alarm.current.id)) stopAlarm();
       else renderAlarmPanel(); // 响铃面板时间每秒走动
     }
     syncKeepAlive(); // 跟随「有药品正在输液」状态启停保活
