@@ -366,6 +366,7 @@
 
   /** 开启提醒：解锁音频（响铃）+ 申请系统通知权限 */
   async function enableAlert() {
+    keepAllowed = true; // 用户手势来了：允许播放（响铃 + 后台保活）
     const ctx = ensureAudio();
     if (!ctx) {
       showToast('当前浏览器不支持铃声，将用震动 + 通知提醒');
@@ -504,15 +505,170 @@
     });
   }
 
+  /* ---------------- WAV 编码：把铃声离线渲染成音频资源 ---------------- */
+  /* 走 <audio> 播放 = 走系统「媒体播放」通道，切后台/锁屏后仍能出声，
+     这是网页端能做到的、最接近系统闹钟的方式（合成音只在前台可靠） */
+
+  const ringUrlCache = {};
+  let silentUrl = null;
+
+  function encodeWav(samples, sampleRate) {
+    const len = samples.length;
+    const view = new DataView(new ArrayBuffer(44 + len * 2));
+    const str = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+    str(0, 'RIFF');
+    view.setUint32(4, 36 + len * 2, true);
+    str(8, 'WAVE');
+    str(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    str(36, 'data');
+    view.setUint32(40, len * 2, true);
+    let off = 44;
+    for (let i = 0; i < len; i++) {
+      const v = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(off, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+      off += 2;
+    }
+    return new Blob([view], { type: 'audio/wav' });
+  }
+
+  /** 用与实时合成相同的音符参数，离线渲染「一遍铃声」为可循环的 WAV */
+  function renderRingUrl(soundKey) {
+    if (ringUrlCache[soundKey]) return ringUrlCache[soundKey];
+    const s = ALARM_SOUNDS[soundKey] || ALARM_SOUNDS.classic;
+    const sr = 8000;
+    const dur = Math.max(0.9, s.gap);
+    const len = Math.ceil(dur * sr);
+    const pcm = new Float32Array(len);
+
+    const tone = (freq, startSec, noteDur) => {
+      const from = Math.max(0, Math.floor(startSec * sr));
+      const to = Math.min(len, Math.floor((startSec + noteDur) * sr));
+      for (let i = from; i < to; i++) {
+        const t = (i - from) / sr;
+        const env = t < 0.012 ? t / 0.012 : Math.exp(-(t - 0.012) * (6 / Math.max(0.05, noteDur)));
+        const ph = 2 * Math.PI * freq * t;
+        let v;
+        if (s.wave === 'square') v = Math.sin(ph) > 0 ? 0.7 : -0.7;
+        else if (s.wave === 'triangle') v = (2 / Math.PI) * Math.asin(Math.sin(ph));
+        else v = Math.sin(ph);
+        pcm[i] += v * env * 0.55;
+      }
+    };
+    s.seq.forEach((f, i) => { if (f > 0) tone(f, i * (s.dur + 0.07), s.dur); });
+
+    const url = URL.createObjectURL(encodeWav(pcm, sr));
+    ringUrlCache[soundKey] = url;
+    return url;
+  }
+
+  function silentWavUrl() {
+    if (!silentUrl) silentUrl = URL.createObjectURL(encodeWav(new Float32Array(4000), 8000));
+    return silentUrl;
+  }
+
+  /* ---------------- 音频元素 + 媒体会话 + 后台保活 ---------------- */
+
+  let ringAudioEl = null;
+  let keepAudioEl = null;
+  let keepAllowed = false; // 是否已在用户手势中获得播放许可
+  let keepPlaying = false;
+
+  function getRingAudio() {
+    if (!ringAudioEl) {
+      ringAudioEl = document.createElement('audio');
+      ringAudioEl.setAttribute('playsinline', '');
+      ringAudioEl.loop = true;
+      document.body.appendChild(ringAudioEl);
+    }
+    return ringAudioEl;
+  }
+
+  function getKeepAudio() {
+    if (!keepAudioEl) {
+      keepAudioEl = document.createElement('audio');
+      keepAudioEl.setAttribute('playsinline', '');
+      keepAudioEl.loop = true;
+      keepAudioEl.src = silentWavUrl();
+      document.body.appendChild(keepAudioEl);
+    }
+    return keepAudioEl;
+  }
+
+  function updateMediaSession(task) {
+    if (!('mediaSession' in navigator)) return;
+    try {
+      if (!task) {
+        navigator.mediaSession.metadata = null;
+        navigator.mediaSession.playbackState = 'none';
+        return;
+      }
+      navigator.mediaSession.metadata = new window.MediaMetadata({
+        title: task.label + ' 输液中',
+        artist: '输液计时器 · 参考 ' + task.expectedMin + ' 分钟',
+        artwork: [{ src: './icon.svg', sizes: 'any', type: 'image/svg+xml' }],
+      });
+      navigator.mediaSession.playbackState = 'playing';
+    } catch (e) { /* 忽略不支持的环境 */ }
+  }
+
+  /**
+   * 保活：有药品正在输液时保持一路静音播放，
+   * 让系统的媒体通道一直活跃 → 切后台/锁屏后定时器仍会跑、铃声仍能出声。
+   * 首次启动必须在用户手势中（浏览器自动播放限制）。
+   */
+  function syncKeepAlive() {
+    const running = state.tasks.find((t) => t.status === 'running');
+    if (!running) {
+      stopKeepAlive();
+      updateMediaSession(null);
+      return;
+    }
+    updateMediaSession(running);
+    if (!keepAllowed) return; // 等一次用户手势
+    const el = getKeepAudio();
+    if (keepPlaying && !el.paused) return;
+    const p = el.play();
+    if (p && p.then) p.then(() => { keepPlaying = true; }).catch(() => { keepPlaying = false; });
+    else keepPlaying = true;
+  }
+
+  function stopKeepAlive() {
+    if (keepAudioEl && !keepAudioEl.paused) {
+      try { keepAudioEl.pause(); } catch (e) { /* 忽略 */ }
+    }
+    keepPlaying = false;
+  }
+
   function startRing(soundKey) {
     stopRing();
     const s = ALARM_SOUNDS[soundKey] || ALARM_SOUNDS.classic;
-    playRingBar(soundKey);
-    ringTimer = window.setInterval(() => playRingBar(soundKey), s.gap * 1000);
+
+    // ① 优先用 <audio> 走媒体通道（后台/锁屏可继续出声）
+    const el = getRingAudio();
+    el.src = renderRingUrl(soundKey);
+    el.volume = Math.max(0.08, Math.min(1, alarm.volume));
+    const p = el.play();
+    if (p && p.catch) p.catch(() => { /* 被拦截时走下面的合成音 */ });
+
+    // ② 每秒检查：<audio> 没在响（被系统暂停/不支持）就用实时合成兜底
+    ringTimer = window.setInterval(() => {
+      const playing = ringAudioEl && !ringAudioEl.paused && !ringAudioEl.ended;
+      if (!playing) playRingBar(soundKey);
+    }, s.gap * 1000);
   }
 
   function stopRing() {
     if (ringTimer) { window.clearInterval(ringTimer); ringTimer = null; }
+    if (ringAudioEl && !ringAudioEl.paused) {
+      try { ringAudioEl.pause(); ringAudioEl.currentTime = 0; } catch (e) { /* 忽略 */ }
+    }
   }
 
   function startVibe() {
@@ -885,6 +1041,8 @@
     // 重新开始计时：重置该任务的提醒状态
     state.ringed.delete(result.id);
     state.alerted.delete('pre:' + result.id);
+    keepAllowed = true;
+    syncKeepAlive(); // 开始输液 → 启动后台保活（切后台/锁屏也能响）
     const willFinishAt = result.startTs + result.expectedMin * 60 * 1000;
     await showModal({
       title: '✅ 已开始输注',
@@ -950,8 +1108,10 @@
         '3. 选中规范库药品后，会按当前含量给出参照输注时间\n' +
         '4. 按「开始输液」计时；参考时长到点后会像闹钟一样响铃，\n' +
         '   响铃页可「停止响铃」「5 分钟后提醒」、或点「铃声」切换音色\n' +
-        '5. 保持本页面在前台（或从主屏幕图标打开）响铃最可靠；\n' +
-        '   长时间离开时可点「到点提醒我」导出日历做后台兜底\n' +
+        '5. 有药品正在输液时会保持一路静音播放（锁屏可见播放控制），\n' +
+        '   让切后台/锁屏后仍能响铃；若彻底关闭本页面则无法响铃，\n' +
+        '   可提前点「到点提醒我」导出日历做后台兜底\n' +
+        '6. 建议「添加到主屏幕」后使用，响铃与保活更稳定\n' +
         '预计时长仅供参考，可随时结束。',
       confirmText: '知道了',
       showCancel: false,
@@ -1540,9 +1700,8 @@
     else renderMonitor();
   }
 
-  /** 秒级刷新 + 提前提醒 + 到点响铃（预计时间仅供参考，每瓶只提醒一次） */
-  function tick() {
-    updateLive();
+  /** 提醒检测：提前提醒 + 到点响铃（前台、后台都要跑，否则切后台就等不到响铃） */
+  function checkAlerts() {
     const t = Date.now();
 
     for (const task of state.tasks) {
@@ -1567,6 +1726,13 @@
     }
 
     if (alarm.current) renderAlarmPanel(); // 响铃面板时间每秒走动
+    syncKeepAlive(); // 跟随「有药品正在输液」状态启停保活
+  }
+
+  /** 前台秒级刷新（含提醒检测） */
+  function tick() {
+    updateLive();
+    checkAlerts();
   }
 
   /**
@@ -1634,9 +1800,17 @@
       }
     });
 
+    // 首次用户手势后放行播放（响铃与保活静音音轨都受自动播放策略限制）
+    document.addEventListener('pointerdown', () => {
+      if (keepAllowed) return;
+      keepAllowed = true;
+      syncKeepAlive();
+    }, { passive: true });
+
     window.setInterval(() => {
-      if (document.hidden) return;
-      tick();
+      // 切后台/锁屏也继续检测：保活音轨维持媒体通道，到点照样响铃
+      if (document.hidden) checkAlerts();
+      else tick();
     }, 1000);
 
     if (!document.hidden) catchUp();
