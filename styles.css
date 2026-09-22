@@ -349,7 +349,7 @@ svg { width: 100%; height: 100%; display: block; }
   color: var(--foreground);
   flex: 0 0 auto;
 }
-.btn-soft svg { width: 16px; height: 16px; }
+.btn-soft svg { width: 16px; height: 16px; flex: none; }
 .btn-soft:active { background: var(--secondary); }
 .btn-block { flex: 1; }
 
@@ -366,7 +366,7 @@ svg { width: 100%; height: 100%; display: block; }
   font-size: 14.5px;
   font-weight: 600;
 }
-.btn-danger svg { width: 14px; height: 14px; }
+.btn-danger svg { width: 15px; height: 15px; flex: none; }
 .btn-danger:active { background: var(--destructive-press); }
 
 .btn-success {
@@ -382,6 +382,7 @@ svg { width: 100%; height: 100%; display: block; }
   font-size: 14.5px;
   font-weight: 600;
 }
+.btn-success svg { width: 17px; height: 17px; flex: none; }
 .btn-success:active { filter: brightness(0.94); }
 
 /* ===================== 分页 ===================== */
