@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+<meta name="theme-color" content="#2E9EB0" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="输液计时器" />
+<meta name="description" content="特殊药品单瓶输液计时工具，数据仅存本机，不含患者信息" />
+<title>输液计时器 · 特殊药品输注计时</title>
+<link rel="manifest" href="./manifest.webmanifest" />
+<link rel="apple-touch-icon" href="./icon.svg" />
+<link rel="icon" href="./icon.svg" />
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<div class="app-shell" id="app">
+
+  <!-- ==================== 监护台 ==================== -->
+  <section class="view" id="view-monitor">
+
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9.2 2.6h5.6" />
+            <path d="M12 2.6v1.6" />
+            <path d="M7.6 5.2h8.8v9.4a4.4 4.4 0 0 1-4.4 4.4h0a4.4 4.4 0 0 1-4.4-4.4V5.2z" />
+            <path d="M12 19v2.4" />
+            <path d="M9.6 9.4h4.8" />
+          </svg>
+        </span>
+        <div class="brand-text">
+          <h1>输液计时器</h1>
+          <p>特殊药品输注计时</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button type="button" class="ghost-btn" id="btn-notify">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18 8a6 6 0 1 0-12 0c0 6-2 7-2 7h16s-2-1-2-7" />
+            <path d="M10.3 20a2 2 0 0 0 3.4 0" />
+          </svg>
+          <span id="notify-text">开启推送</span>
+        </button>
+        <button type="button" class="ghost-btn" id="btn-help">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M9.6 9.2a2.5 2.5 0 1 1 3.4 2.3c-.7.3-1 .9-1 1.6v.4" />
+            <path d="M12 17.2h.01" />
+          </svg>
+          <span>使用说明</span>
+        </button>
+      </div>
+    </header>
+
+    <p class="disclaimer">本工具仅供参考，不构成医疗建议，具体以临床医生意见为准</p>
+
+    <div class="a2hs" id="a2hs-tip" hidden>
+      <span class="a2hs-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 15V3" /><path d="M8 7l4-4 4 4" /><path d="M5 15v4h14v-4" />
+        </svg>
+      </span>
+      <span class="a2hs-text">Safari：点击分享按钮，选择“添加到主屏幕”</span>
+      <button type="button" class="a2hs-close" id="a2hs-close" aria-label="关闭提示">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+      </button>
+    </div>
+
+    <div class="segmented" id="tabs" role="tablist">
+      <button type="button" class="seg-btn is-active" data-tab="active" role="tab">
+        进行中 <span class="seg-num" id="cnt-active">0</span>
+      </button>
+      <button type="button" class="seg-btn" data-tab="done" role="tab">
+        已结束 <span class="seg-num" id="cnt-done">0</span>
+      </button>
+    </div>
+
+    <main class="scroll-area" id="list-scroll">
+      <div class="inner">
+        <div class="stats" id="stats" hidden>
+          <div class="stat-card">
+            <strong id="stat-count">0</strong>
+            <span>已完成瓶数</span>
+          </div>
+          <div class="stat-card">
+            <strong id="stat-avg">0min</strong>
+            <span>平均单瓶用时</span>
+          </div>
+        </div>
+        <div class="list" id="list"></div>
+        <nav class="pager" id="pager" hidden>
+          <button type="button" class="pager-btn" data-page="prev">‹ 上一页</button>
+          <span class="pager-info" id="pager-info">1 / 1</span>
+          <button type="button" class="pager-btn" data-page="next">下一页 ›</button>
+        </nav>
+      </div>
+    </main>
+
+    <footer class="bottom-bar">
+      <button type="button" class="primary-pill" id="btn-add">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+        新增特殊药品
+      </button>
+    </footer>
+  </section>
+
+  <!-- ==================== 新增特殊药品 ==================== -->
+  <section class="view" id="view-add" hidden>
+    <header class="app-header app-header--compact">
+      <button type="button" class="ghost-btn ghost-btn--icon" id="btn-back" aria-label="返回">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7" /></svg>
+      </button>
+      <div class="brand-text">
+        <h1>新增特殊药品</h1>
+        <p>仅记录药品信息，勿填患者信息</p>
+      </div>
+    </header>
+
+    <main class="scroll-area" id="form-scroll">
+      <div class="inner form">
+        <div class="field">
+          <label class="field-label" for="f-name">药品名称（可手动输入，或点右侧从规范库选择）</label>
+          <div class="field-card picker-field">
+            <input class="field-input" id="f-name" type="text" maxlength="12" autocomplete="off" placeholder="如：万古霉素" />
+            <button type="button" class="picker-toggle" data-picker="drug" aria-haspopup="listbox" aria-expanded="false" aria-label="从规范库选择药品">
+              <span class="picker-chevron" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6" /></svg>
+              </span>
+            </button>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="f-ml">总量（ml）</label>
+          <div class="field-card">
+            <input class="field-input" id="f-ml" type="text" inputmode="decimal" autocomplete="off" placeholder="如：250" />
+          </div>
+        </div>
+
+        <!-- 输液规范参照：选中规范库药品后，按当前含量给出参照输注时间 -->
+        <div class="spec-ref" id="spec-ref" hidden>
+          <div class="spec-ref-head">
+            <span class="spec-ref-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5.5h9M4 12h13M4 18.5h7" /><path d="M17 15l3 3-3 3" /></svg>
+              输液规范参照
+            </span>
+            <span class="spec-ref-level" id="spec-ref-level"></span>
+          </div>
+          <div class="spec-ref-main">
+            <span class="spec-ref-time" id="spec-ref-time">—</span>
+            <span class="spec-ref-cap" id="spec-ref-cap"></span>
+          </div>
+          <div class="spec-ref-grid" id="spec-ref-grid"></div>
+          <p class="spec-ref-note" id="spec-ref-note" hidden></p>
+          <p class="spec-ref-warn" id="spec-ref-warn" hidden></p>
+          <button type="button" class="spec-ref-apply" id="spec-ref-apply" hidden></button>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="f-factor">滴系数（滴/ml）</label>
+          <button type="button" class="field-card picker-trigger" data-picker="factor" aria-haspopup="listbox" aria-expanded="false">
+            <span class="picker-value" id="view-factor">20</span>
+            <span class="picker-chevron" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6" /></svg>
+            </span>
+          </button>
+          <input type="hidden" id="f-factor" value="20" />
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="f-rate">滴速（滴/分，选填）</label>
+          <div class="field-card">
+            <input class="field-input" id="f-rate" type="text" inputmode="decimal" autocomplete="off" placeholder="如：50，填了自动算参考时长" />
+          </div>
+          <p class="field-tip" id="rate-tip" hidden></p>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="f-duration">参考时长（填滴速后自动同步）</label>
+          <button type="button" class="field-card picker-trigger" id="f-duration-card" data-picker="duration" aria-haspopup="listbox" aria-expanded="false">
+            <span class="picker-value" id="view-duration">60 分钟</span>
+            <span class="picker-chevron" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6" /></svg>
+            </span>
+          </button>
+          <input type="hidden" id="f-duration" value="60" />
+          <p class="field-auto" id="auto-duration" hidden></p>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="f-alert">提前提醒</label>
+          <button type="button" class="field-card picker-trigger" data-picker="alert" aria-haspopup="listbox" aria-expanded="false">
+            <span class="picker-value" id="view-alert">还剩 5 分钟时提醒我</span>
+            <span class="picker-chevron" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6" /></svg>
+            </span>
+          </button>
+          <input type="hidden" id="f-alert" value="5" />
+        </div>
+
+        <button type="button" class="primary-btn" id="btn-create">创建监测</button>
+        <p class="form-hint">标签自动编号（如 万古霉素-01），用于区分不同患者的同类药</p>
+      </div>
+    </main>
+  </section>
+
+</div>
+
+<div class="picker-root" id="picker-root" hidden></div>
+<div class="modal-root" id="modal-root" hidden></div>
+<div class="toast-root" id="toast-root" aria-live="polite"></div>
+
+<script src="./specs.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>

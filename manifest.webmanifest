@@ -1,0 +1,20 @@
+{
+  "name": "输液计时器 · 特殊药品输注计时",
+  "short_name": "输液计时器",
+  "description": "特殊药品单瓶输液计时工具，纯本地存储，不含患者信息",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F5F6F8",
+  "theme_color": "#2E9EB0",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

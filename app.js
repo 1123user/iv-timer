@@ -1,0 +1,1377 @@
+/**
+ * 输液计时器 · 网页端（H5）
+ * ------------------------------------------------------------------
+ * 由「输液计时器-网页版复刻完整资料包」中的小程序源码 + 网页版复刻提示词
+ * 迁移而来：核心业务逻辑（状态机 / 循环校验 / 参考时长 / 进度与剩余时间）
+ * 与平台无关，此处照搬；平台相关能力按对照表替换为浏览器 API。
+ *
+ * - Taro.StorageSync   -> localStorage（JSON 序列化）
+ * - Taro.showModal     -> 自建 Promise 弹窗
+ * - Taro.showToast     -> 自建轻提示
+ * - Taro.vibrateLong   -> navigator.vibrate
+ * - Taro.navigateTo    -> location.hash 路由
+ * - useDidShow         -> visibilitychange + 首次加载补报
+ *
+ * 全部数据仅存本机 localStorage，无网络请求、无患者隐私字段。
+ */
+'use strict';
+
+(function () {
+  /* ============================================================
+   * 一、数据层（对应 iv-store.ts）
+   * ============================================================ */
+
+  const TASK_KEY = 'iv_bottle_tasks'; // 任务列表
+  const SEQ_KEY = 'iv_drug_seq';      // 药品序号自增映射
+  const A2HS_KEY = 'iv_a2hs_dismissed';
+
+  /* ---------------- 基础读写（带容错） ---------------- */
+
+  function lsGet(key, fallback) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw === null || raw === undefined) return fallback;
+      const parsed = JSON.parse(raw);
+      return parsed === null || parsed === undefined ? fallback : parsed;
+    } catch (e) {
+      console.warn('[iv-store] 读取本地存储失败', key, e);
+      return fallback;
+    }
+  }
+
+  function lsSet(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (e) {
+      console.warn('[iv-store] 写入本地存储失败', key, e);
+    }
+  }
+
+  /* ---------------- 循环校验（防差错核心） ---------------- */
+
+  const isTs = (v) => typeof v === 'number' && Number.isFinite(v) && v > 0;
+
+  /**
+   * 单条任务校验：
+   * 1. 数值字段为有限正数；label 非空；
+   * 2. 状态与时间戳一致：pending 无戳；running 只有 startTs；done 两戳齐全且 endTs >= startTs；
+   * 3. 声明状态不得超前于推导状态，否则剔除。
+   */
+  function verifyTask(t) {
+    if (!t || typeof t.id !== 'string' || typeof t.label !== 'string' || !t.label) return null;
+    if (!Number.isFinite(t.totalMl) || t.totalMl <= 0) return null;
+    if (!Number.isFinite(t.dripFactor) || t.dripFactor <= 0) return null;
+    if (!Number.isFinite(t.expectedMin) || t.expectedMin <= 0) return null;
+    if (!Number.isFinite(t.alertMin) || t.alertMin <= 0) return null;
+    if (!Number.isFinite(t.createdTs)) return null;
+
+    const startTs = isTs(t.startTs) ? t.startTs : null;
+    const endTs = isTs(t.endTs) ? t.endTs : null;
+    if (startTs && endTs && endTs < startTs) return null;
+
+    let derived = 'pending';
+    if (startTs && endTs) derived = 'done';
+    else if (startTs) derived = 'running';
+
+    const order = ['pending', 'running', 'done'];
+    if (order.indexOf(t.status) > order.indexOf(derived)) return null;
+
+    return Object.assign({}, t, {
+      manufacturer: typeof t.manufacturer === 'string' ? t.manufacturer : '',
+      dripRate: Number.isFinite(t.dripRate) && t.dripRate > 0 ? t.dripRate : undefined,
+      startTs: startTs,
+      endTs: endTs,
+      status: derived,
+    });
+  }
+
+  function verifyTasks(list) {
+    const seen = new Set();
+    const out = [];
+    for (const item of list) {
+      const fixed = verifyTask(item);
+      if (fixed && !seen.has(fixed.id)) {
+        seen.add(fixed.id);
+        out.push(fixed);
+      }
+    }
+    return out;
+  }
+
+  /** 读取 + 校验 + 修复回写（闭环自检） */
+  function loadTasks() {
+    const raw = lsGet(TASK_KEY, []);
+    const arr = Array.isArray(raw) ? raw : [];
+    const verified = verifyTasks(arr);
+    if (verified.length !== arr.length) lsSet(TASK_KEY, verified);
+    return verified;
+  }
+
+  function writeTasks(list) {
+    lsSet(TASK_KEY, list);
+  }
+
+  /* ---------------- 状态机操作 ---------------- */
+
+  function genId() {
+    return 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  }
+
+  /** 药品序号：同一药品名自增，持久化，便于区分不同患者的同类药 */
+  function nextLabel(drugName) {
+    let map = {};
+    const raw = lsGet(SEQ_KEY, null);
+    if (raw && typeof raw === 'object') map = raw;
+    const n = (map[drugName] || 0) + 1;
+    map[drugName] = n;
+    lsSet(SEQ_KEY, map);
+    return drugName + '-' + String(n).padStart(2, '0');
+  }
+
+  function addTask(input) {
+    const task = {
+      id: genId(),
+      label: input.label,
+      manufacturer: input.manufacturer,
+      totalMl: input.totalMl,
+      dripFactor: input.dripFactor,
+      dripRate: input.dripRate,
+      expectedMin: input.expectedMin,
+      alertMin: input.alertMin,
+      status: 'pending',
+      startTs: null,
+      endTs: null,
+      createdTs: Date.now(),
+    };
+    const list = loadTasks();
+    list.unshift(task);
+    writeTasks(verifyTasks(list));
+    return task;
+  }
+
+  /**
+   * 状态推进：start(pending→running) / finish(running→done)
+   * 防差错：先重载校验状态合法才推进；推进后单条复验，通不过不写。
+   */
+  function advance(id, type) {
+    const list = loadTasks();
+    const idx = list.findIndex((t) => t.id === id);
+    if (idx < 0) return null;
+    const task = list[idx];
+    const now = Date.now();
+
+    const allowed =
+      (type === 'start' && task.status === 'pending') ||
+      (type === 'finish' && task.status === 'running');
+    if (!allowed) return null;
+
+    const next = Object.assign({}, task);
+    if (type === 'start') {
+      next.startTs = now;
+      next.status = 'running';
+    } else {
+      next.endTs = now;
+      next.status = 'done';
+    }
+
+    const recheck = verifyTask(next);
+    if (!recheck || recheck.id !== id) return null;
+
+    list.splice(idx, 1, recheck);
+    writeTasks(verifyTasks(list));
+    return recheck;
+  }
+
+  function removeTask(id) {
+    writeTasks(loadTasks().filter((t) => t.id !== id));
+  }
+
+  /* ---------------- 计算与格式化 ---------------- */
+
+  function fmtDuration(ms) {
+    if (!Number.isFinite(ms) || ms < 0) ms = 0;
+    const totalSec = Math.floor(ms / 1000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    const mm = String(m).padStart(2, '0');
+    const ss = String(s).padStart(2, '0');
+    return h > 0 ? h + ':' + mm + ':' + ss : mm + ':' + ss;
+  }
+
+  /** 友好时长：1h 15min / 45min */
+  function fmtHuman(ms) {
+    if (!Number.isFinite(ms) || ms < 0) ms = 0;
+    const totalMin = Math.round(ms / 60000);
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    if (h > 0 && m > 0) return h + 'h ' + m + 'min';
+    if (h > 0) return h + 'h';
+    return m + 'min';
+  }
+
+  function fmtClock(ts) {
+    if (!ts) return '--:--';
+    const d = new Date(ts);
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+
+  function fmtMonthDay(ts) {
+    if (!ts) return '';
+    const d = new Date(ts);
+    return (d.getMonth() + 1) + '/' + d.getDate();
+  }
+
+  /** 已输注毫秒数 */
+  function elapsedMs(task, now) {
+    if (!task.startTs) return 0;
+    const end = task.endTs || now;
+    return Math.max(0, end - task.startTs);
+  }
+
+  /** 剩余毫秒数（仅 running；可能为负 = 超过参考时长） */
+  function remainingMs(task, now) {
+    if (task.status !== 'running') return Infinity;
+    return task.expectedMin * 60 * 1000 - elapsedMs(task, now);
+  }
+
+  /** 进度 0~1 */
+  function progress(task, now) {
+    const total = task.expectedMin * 60 * 1000;
+    if (total <= 0) return 0;
+    return Math.min(1, elapsedMs(task, now) / total);
+  }
+
+  /** 参考时长：分钟 = 总量ml × 滴系数 ÷ 滴速（至少 1 分钟） */
+  function calcMinutes(totalMl, dripFactor, dripRate) {
+    if (!(totalMl > 0) || !(dripFactor > 0) || !(dripRate > 0)) return null;
+    return Math.max(1, Math.round((totalMl * dripFactor) / dripRate));
+  }
+
+  /* ============================================================
+   * 二、浏览器能力封装（modal / toast / vibrate / 通知 / 日历）
+   * ============================================================ */
+
+  const $ = (sel, root) => (root || document).querySelector(sel);
+  const $$ = (sel, root) => Array.prototype.slice.call((root || document).querySelectorAll(sel));
+
+  function esc(str) {
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  /** 自建弹窗，替代 Taro.showModal */
+  function showModal(opts) {
+    return new Promise((resolve) => {
+      const root = $('#modal-root');
+      const showCancel = opts.showCancel !== false;
+      root.hidden = false;
+      root.innerHTML =
+        '<div class="modal" role="dialog" aria-modal="true">' +
+        '<h2>' + esc(opts.title) + '</h2>' +
+        '<p class="modal-body">' + esc(opts.content || '') + '</p>' +
+        '<div class="modal-actions">' +
+        (showCancel ? '<button type="button" class="modal-btn" data-result="0">' + esc(opts.cancelText || '取消') + '</button>' : '') +
+        '<button type="button" class="modal-btn ' +
+        (opts.tone === 'danger' ? 'modal-btn--danger' : 'modal-btn--primary') +
+        '" data-result="1">' + esc(opts.confirmText || '确定') + '</button>' +
+        '</div></div>';
+
+      const close = (value) => {
+        root.hidden = true;
+        root.innerHTML = '';
+        resolve(value);
+      };
+
+      $$('[data-result]', root).forEach((btn) => {
+        btn.addEventListener('click', () => close(btn.getAttribute('data-result') === '1'));
+      });
+      root.addEventListener('click', (e) => {
+        if (e.target === root) close(false);
+      });
+    });
+  }
+
+  /** 自建轻提示，替代 Taro.showToast */
+  function showToast(message, ok) {
+    const root = $('#toast-root');
+    const el = document.createElement('div');
+    el.className = 'toast' + (ok ? ' toast--ok' : '');
+    el.textContent = message;
+    root.appendChild(el);
+    window.setTimeout(() => {
+      el.style.transition = 'opacity .25s ease';
+      el.style.opacity = '0';
+      window.setTimeout(() => el.remove(), 280);
+    }, ok ? 1600 : 2600);
+  }
+
+  /** 震动反馈，替代 Taro.vibrateLong / vibrateShort */
+  function vibrate(long) {
+    try {
+      if (navigator.vibrate) navigator.vibrate(long ? [80, 60, 80] : 35);
+    } catch (e) { /* 不支持的环境忽略 */ }
+  }
+
+  /* ---------------- 系统通知（图片中的「开启推送」） ---------------- */
+
+  const notifySupported = () => typeof window.Notification !== 'undefined';
+
+  function notifyGranted() {
+    return notifySupported() && Notification.permission === 'granted';
+  }
+
+  function pushNotify(title, body) {
+    if (!notifyGranted()) return;
+    try {
+      // eslint-disable-next-line no-new
+      new Notification(title, { body: body, tag: 'iv-timer', icon: './icon.svg' });
+    } catch (e) { /* 部分浏览器需 ServiceWorker，忽略 */ }
+  }
+
+  function syncNotifyButton() {
+    const btn = $('#btn-notify');
+    const text = $('#notify-text');
+    if (!btn) return;
+    btn.classList.toggle('is-on', notifyGranted());
+    if (text) {
+      if (notifyGranted()) text.textContent = '推送已开启';
+      else if (notifySupported() && Notification.permission === 'denied') text.textContent = '推送已关闭';
+      else text.textContent = '开启推送';
+    }
+  }
+
+  async function enablePush() {
+    if (!notifySupported()) {
+      showToast('当前浏览器不支持系统通知，可用「到点提醒我」导入日历');
+      return;
+    }
+    if (Notification.permission === 'granted') {
+      showToast('推送已开启', true);
+      return;
+    }
+    if (Notification.permission === 'denied') {
+      showToast('推送已被拒绝，请在浏览器设置中允许通知');
+      return;
+    }
+    try {
+      const res = await Notification.requestPermission();
+      syncNotifyButton();
+      if (res === 'granted') {
+        vibrate(false);
+        showToast('推送已开启，到点会通知你', true);
+      } else {
+        showToast('未开启推送，可用「到点提醒我」导入日历');
+      }
+    } catch (e) {
+      showToast('开启推送失败，可用「到点提醒我」导入日历');
+    }
+  }
+
+  /* ---------------- .ics 日历下载（照搬源码逻辑） ---------------- */
+
+  function downloadIcs(task, cancel) {
+    if (!task.startTs) return;
+    const pad = (n) => String(n).padStart(2, '0');
+    const fmtIcs = (ts) => {
+      const d = new Date(ts);
+      return (
+        d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + 'T' +
+        pad(d.getHours()) + pad(d.getMinutes()) + '00'
+      );
+    };
+    const endTs = task.startTs + task.expectedMin * 60 * 1000;
+    const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0'];
+    if (cancel) lines.push('METHOD:CANCEL');
+    lines.push('BEGIN:VEVENT');
+    lines.push('UID:' + task.id + '@iv-timer');
+    lines.push('DTSTART:' + fmtIcs(endTs));
+    lines.push('DTEND:' + fmtIcs(endTs + 5 * 60 * 1000));
+    lines.push('SUMMARY:' + (cancel ? '✅ 已完成 ' : '⏰ ') + task.label + ' 预计输完');
+    lines.push('DESCRIPTION:参考时长 ' + task.expectedMin + ' 分钟，请查看输注情况');
+    if (cancel) {
+      lines.push('STATUS:CANCELLED', 'SEQUENCE:1');
+    } else {
+      lines.push('BEGIN:VALARM', 'TRIGGER:-PT0M', 'ACTION:DISPLAY', 'END:VALARM');
+    }
+    lines.push('END:VEVENT', 'END:VCALENDAR');
+
+    const blob = new Blob([lines.join('\r\n')], { type: 'text/calendar;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = task.label + '-' + (cancel ? '取消提醒' : '提醒') + '.ics';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast(cancel ? '已下载，打开即可删除日历提醒' : '已下载，点「打开 → 添加到日历」即可', true);
+  }
+
+  /* ============================================================
+   * 三、监护台视图
+   * ============================================================ */
+
+  const PAGE_SIZE = 8; // 病区药品多时分页浏览
+
+  const state = {
+    tasks: [],
+    tab: 'active',
+    page: 0,
+    expandId: null,
+    alerted: new Set(),
+  };
+
+  const ICON_CHEVRON_DOWN =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
+  const ICON_CHEVRON_UP =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 15l-6-6-6 6"/></svg>';
+  const ICON_CALENDAR =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="16" rx="2.5"/><path d="M8 3v3M16 3v3M3 9.5h18"/></svg>';
+  const ICON_STOP =
+    '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+  const ICON_PLAY =
+    '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l11-6.5z"/></svg>';
+  const ICON_TIMER =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13.4" r="7.6"/><path d="M12 10.4v3.2l2.2 1.4"/><path d="M9.4 3h5.2"/></svg>';
+
+  function reload() {
+    state.tasks = loadTasks();
+  }
+
+  function currentList() {
+    const active = state.tasks.filter((t) => t.status !== 'done');
+    const done = state.tasks.filter((t) => t.status === 'done');
+    return state.tab === 'active' ? active : done;
+  }
+
+  function renderMonitor() {
+    reload();
+    const activeList = state.tasks.filter((t) => t.status !== 'done');
+    const doneList = state.tasks.filter((t) => t.status === 'done');
+
+    $('#cnt-active').textContent = String(activeList.length);
+    $('#cnt-done').textContent = String(doneList.length);
+    $$('.seg-btn').forEach((b) => b.classList.toggle('is-active', b.getAttribute('data-tab') === state.tab));
+
+    const shown = currentList();
+    const pageCount = Math.max(1, Math.ceil(shown.length / PAGE_SIZE));
+    if (state.page > pageCount - 1) state.page = pageCount - 1;
+    const pageItems = shown.slice(state.page * PAGE_SIZE, state.page * PAGE_SIZE + PAGE_SIZE);
+
+    /* -------- 已结束：顶部统计（完成瓶数 / 平均单瓶用时） -------- */
+    const stats = $('#stats');
+    stats.hidden = state.tab !== 'done';
+    if (state.tab === 'done') {
+      const now = Date.now();
+      const avg = doneList.length > 0
+        ? doneList.reduce((sum, t) => sum + elapsedMs(t, now), 0) / doneList.length
+        : 0;
+      $('#stat-count').textContent = String(doneList.length);
+      $('#stat-avg').textContent = fmtHuman(avg);
+    }
+
+    /* -------- 列表 -------- */
+    const list = $('#list');
+    if (pageItems.length === 0) {
+      list.innerHTML =
+        '<div class="empty">' + ICON_TIMER +
+        '<span>' + (state.tab === 'active' ? '暂无进行中的药品' : '暂无已结束的记录') + '</span>' +
+        (state.tab === 'active' ? '<small>点底部「+ 新增特殊药品」开始</small>' : '<small>结束输液后自动归档</small>') +
+        '</div>';
+    } else {
+      list.innerHTML = pageItems.map((t) => (state.expandId === t.id ? fullCard(t) : miniCard(t))).join('');
+    }
+
+    /* -------- 分页栏 -------- */
+    const pager = $('#pager');
+    pager.hidden = pageCount <= 1;
+    if (pageCount > 1) {
+      $('#pager-info').textContent = (state.page + 1) + ' / ' + pageCount;
+      $('[data-page="prev"]', pager).disabled = state.page <= 0;
+      $('[data-page="next"]', pager).disabled = state.page >= pageCount - 1;
+    }
+
+    updateLive();
+  }
+
+  /* ---------------- 卡片模板 ---------------- */
+
+  function miniCard(t) {
+    return (
+      '<button type="button" class="card-mini" data-id="' + t.id + '" data-role="mini" data-act="toggle">' +
+      '<span class="card-mini-left">' +
+      '<i class="dot dot--' + t.status + '"></i>' +
+      (t.createdTs ? '<span class="badge num">' + esc(fmtMonthDay(t.createdTs)) + '</span>' : '') +
+      '<span class="card-mini-name">' + esc(t.label) + '</span>' +
+      '</span>' +
+      '<span class="card-mini-right">' +
+      '<span class="card-mini-time num" data-live="mini-time"></span>' +
+      '<span class="card-mini-chevron">' + ICON_CHEVRON_DOWN + '</span>' +
+      '</span>' +
+      '</button>'
+    );
+  }
+
+  function fullCard(t) {
+    const ref = t.specRef;
+    const spec =
+      '<div class="spec-grid">' +
+      '<div class="spec-item">总量：<b>' + esc(t.totalMl) + ' ml</b></div>' +
+      '<div class="spec-item">滴系数：<b>' + esc(t.dripFactor) + ' 滴/ml</b></div>' +
+      '<div class="spec-item">滴速：<b>' + (t.dripRate ? esc(t.dripRate) + ' 滴/分' : '—') + '</b></div>' +
+      '<div class="spec-item">限速等级：<b>' + (ref && ref.level ? esc(ref.level) : '—') + '</b></div>' +
+      '</div>' +
+      (ref
+        ? '<div class="card-spec-ref">' +
+          '<span class="card-spec-ref-tag">输液规范</span>' +
+          '<span class="card-spec-ref-text">' +
+          esc(ref.name) +
+          (ref.cls ? ' · ' + esc(ref.cls) : '') +
+          (ref.timeText ? ' · 规范输注 ' + esc(ref.timeText) : '') +
+          (ref.rateText ? ' · 推荐滴速 ' + esc(ref.rateText) + ' 滴/分' : '') +
+          (ref.solvent ? ' · ' + esc(ref.solvent) : '') +
+          '</span>' +
+          (ref.refMin
+            ? '<span class="card-spec-ref-time">参照 ' + (ref.refOpen ? '≥ ' : '') + esc(ref.refMin) + ' 分钟</span>'
+            : '') +
+          '</div>'
+        : '');
+
+    let body = '';
+    if (t.status === 'running') {
+      body =
+        '<span class="timer num" data-live="timer"></span>' +
+        '<div class="progress"><i data-live="progress"></i></div>' +
+        '<div class="meta-row">' +
+        '<span>参考时长 ' + esc(t.expectedMin) + ' 分钟</span>' +
+        '<span class="meta-right" data-live="remain"></span>' +
+        '</div>';
+    } else if (t.status === 'done') {
+      body =
+        '<span class="timer timer--done num" data-live="timer"></span>' +
+        '<div class="progress"><i data-live="progress"></i></div>' +
+        '<div class="meta-row">' +
+        '<span>开始 ' + esc(fmtClock(t.startTs)) + ' · 结束 ' + esc(fmtClock(t.endTs)) + '</span>' +
+        '<span class="meta-right">参考 ' + esc(t.expectedMin) + ' 分钟</span>' +
+        '</div>';
+    } else {
+      body =
+        '<div class="meta-row" style="padding-top:12px">' +
+        '<span>参考时长 ' + esc(t.expectedMin) + ' 分钟 · 提前 ' + esc(t.alertMin) + ' 分钟提醒</span>' +
+        '</div>';
+    }
+
+    let actions = '';
+    if (t.status === 'pending') {
+      actions =
+        '<button type="button" class="btn-success" data-act="start">' + ICON_PLAY + '开始输液</button>' +
+        '<button type="button" class="btn-soft" data-act="delete">删除</button>';
+    } else if (t.status === 'running') {
+      actions =
+        '<button type="button" class="btn-soft" data-act="ics">' + ICON_CALENDAR + '到点提醒我</button>' +
+        '<button type="button" class="btn-danger" data-act="finish">' + ICON_STOP + '结束输液</button>';
+    } else {
+      actions = '<button type="button" class="btn-soft btn-block" data-act="delete">删除记录</button>';
+    }
+
+    return (
+      '<article class="card" data-id="' + t.id + '" data-role="full">' +
+      '<button type="button" class="card-head" data-act="toggle">' +
+      '<i class="dot dot--' + t.status + '"></i>' +
+      (t.createdTs ? '<span class="badge num">' + esc(fmtMonthDay(t.createdTs)) + '</span>' : '') +
+      '<span class="card-name">' + esc(t.label) + '</span>' +
+      '<span class="card-head-time num" data-live="head-time"></span>' +
+      '<span class="card-head-chevron">' + ICON_CHEVRON_UP + '</span>' +
+      '</button>' +
+      spec + body +
+      '<div class="card-actions">' + actions + '</div>' +
+      '</article>'
+    );
+  }
+
+  /* ---------------- 每秒动态刷新 ---------------- */
+
+  function updateLive() {
+    const now = Date.now();
+    for (const t of state.tasks) {
+      const elapsed = elapsedMs(t, now);
+      const mini = $('[data-role="mini"][data-id="' + t.id + '"]');
+      const card = $('[data-role="full"][data-id="' + t.id + '"]');
+
+      const miniTime = mini && $('[data-live="mini-time"]', mini);
+      if (miniTime) {
+        if (t.status === 'pending') miniTime.textContent = '待开始';
+        else if (t.status === 'running') miniTime.textContent = '已输 ' + fmtHuman(elapsed);
+        else miniTime.textContent = '用时 ' + fmtHuman(elapsed);
+      }
+
+      if (!card) continue;
+
+      const headTime = $('[data-live="head-time"]', card);
+      if (headTime) headTime.textContent = t.status === 'pending' ? '待开始' : fmtDuration(elapsed);
+
+      const timer = $('[data-live="timer"]', card);
+      if (timer) {
+        timer.textContent = t.status === 'done' ? '本瓶用时 ' + fmtDuration(elapsed) : fmtDuration(elapsed);
+      }
+
+      const bar = $('[data-live="progress"]', card);
+      if (bar) bar.style.width = Math.min(100, Math.round(progress(t, now) * 100)) + '%';
+
+      const remain = $('[data-live="remain"]', card);
+      if (remain && t.status === 'running') {
+        const rem = remainingMs(t, now);
+        if (rem <= 0) {
+          remain.textContent = '已超参考 ' + fmtDuration(-rem);
+          remain.classList.add('over');
+        } else {
+          remain.textContent = '参考剩余 ' + fmtDuration(rem);
+          remain.classList.remove('over');
+        }
+      }
+    }
+  }
+
+  /* ---------------- 操作（弹窗确认 + 震动反馈） ---------------- */
+
+  async function onStart(task) {
+    const ok = await showModal({
+      title: '请确认',
+      content: '药品：' + task.label + '\n时间：' + fmtClock(Date.now()) + '\n开始输液计时？',
+      confirmText: '确认开始',
+      cancelText: '取消',
+    });
+    if (!ok) return;
+    const result = advance(task.id, 'start');
+    if (!result) {
+      showToast('状态已变化，请重试');
+      renderMonitor();
+      return;
+    }
+    vibrate(true);
+    const willFinishAt = result.startTs + result.expectedMin * 60 * 1000;
+    await showModal({
+      title: '✅ 已开始输注',
+      content:
+        result.label + '\n预计 ' + fmtClock(willFinishAt) + ' 左右输完（参考）\n' +
+        '可点「到点提醒我」导出日历，到点系统日历锁屏提醒',
+      confirmText: '知道了',
+      showCancel: false,
+    });
+    renderMonitor();
+  }
+
+  async function onFinish(task) {
+    const ok = await showModal({
+      title: '请确认',
+      content: '结束「' + task.label + '」输液？\n将记录本瓶实际输注时长。',
+      confirmText: '确认结束',
+      cancelText: '取消',
+    });
+    if (!ok) return;
+    const result = advance(task.id, 'finish');
+    if (!result) {
+      showToast('状态已变化，请重试');
+      renderMonitor();
+      return;
+    }
+    vibrate(true);
+    // 任务结束后：日历提醒视为完成，自动生成取消文件删除对应提醒
+    downloadIcs(result, true);
+    await showModal({
+      title: '✅ 本瓶输注完成',
+      content:
+        result.label + ' 实际输注时长：' + fmtHuman(elapsedMs(result, result.endTs)) +
+        '\n可以开始输注其他药品了。',
+      confirmText: '知道了',
+      showCancel: false,
+    });
+    renderMonitor();
+  }
+
+  async function onDelete(task) {
+    const ok = await showModal({
+      title: '删除确认',
+      content: '确认删除「' + task.label + '」？此操作不可恢复。',
+      confirmText: '删除',
+      cancelText: '取消',
+      tone: 'danger',
+    });
+    if (!ok) return;
+    removeTask(task.id);
+    if (state.expandId === task.id) state.expandId = null;
+    renderMonitor();
+  }
+
+  function showHelp() {
+    showModal({
+      title: '使用说明',
+      content:
+        '1. 点底部「+ 新增特殊药品」，输入药名（勿填患者姓名）\n' +
+        '2. 填总量和滴速可自动算参考时长\n' +
+        '3. 开始输液按「开始输液」，输完按「结束输液」\n' +
+        '4. 展开卡片点「到点提醒我」，导入手机日历后锁屏也能提醒\n' +
+        '预计时长仅供参考，可随时结束。',
+      confirmText: '知道了',
+      showCancel: false,
+    });
+  }
+
+  /* ---------------- 事件绑定 ---------------- */
+
+  function bindMonitor() {
+    $('#tabs').addEventListener('click', (e) => {
+      const btn = e.target.closest('.seg-btn');
+      if (!btn) return;
+      const tab = btn.getAttribute('data-tab');
+      if (tab === state.tab) return;
+      state.tab = tab;
+      state.page = 0;
+      state.expandId = null;
+      renderMonitor();
+    });
+
+    $('#btn-notify').addEventListener('click', enablePush);
+    $('#btn-help').addEventListener('click', showHelp);
+    $('#btn-add').addEventListener('click', () => { location.hash = '#/add'; });
+
+    $('#pager').addEventListener('click', (e) => {
+      const btn = e.target.closest('.pager-btn');
+      if (!btn || btn.disabled) return;
+      const dir = btn.getAttribute('data-page');
+      state.page += dir === 'prev' ? -1 : 1;
+      state.expandId = null;
+      renderMonitor();
+    });
+
+    $('#list').addEventListener('click', (e) => {
+      const node = e.target.closest('[data-act]');
+      if (!node) return;
+      const act = node.getAttribute('data-act');
+      const holder = e.target.closest('[data-id]');
+      if (!holder) return;
+      const id = holder.getAttribute('data-id');
+      const task = state.tasks.find((t) => t.id === id);
+      if (!task) return;
+
+      if (act === 'toggle') {
+        state.expandId = state.expandId === id ? null : id;
+        renderMonitor();
+      } else if (act === 'start') {
+        onStart(task);
+      } else if (act === 'finish') {
+        onFinish(task);
+      } else if (act === 'ics') {
+        downloadIcs(task, false);
+      } else if (act === 'delete') {
+        onDelete(task);
+      }
+    });
+
+    const a2hs = $('#a2hs-tip');
+    const isStandalone =
+      window.navigator.standalone === true ||
+      (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    if (isIOS && !isStandalone && !lsGet(A2HS_KEY, false)) a2hs.hidden = false;
+    $('#a2hs-close').addEventListener('click', () => {
+      a2hs.hidden = true;
+      lsSet(A2HS_KEY, true);
+    });
+  }
+
+  /* ============================================================
+   * 四、新增特殊药品视图
+   * ============================================================ */
+
+  const DURATIONS = [15, 30, 45, 60, 90, 120];
+  const ALERTS = [1, 3, 5, 10, 15];
+
+  let submitting = false;
+
+  /* ---------------- 静脉输液规范（specs.js） ---------------- */
+
+  const SPECS = Array.isArray(window.IV_SPECS) ? window.IV_SPECS : [];
+
+  /** 名称匹配：精确优先，其次「包含」，多项命中取最长者（如 头孢他啶阿维巴坦 优先于 头孢他啶） */
+  function findSpec(name) {
+    const key = String(name || '').trim().replace(/\s+/g, '');
+    if (!key) return null;
+    let exact = null;
+    let partial = null;
+    for (const s of SPECS) {
+      const n = String(s.name).replace(/\s+/g, '');
+      if (n === key) { exact = s; break; }
+      if (n.indexOf(key) >= 0 || key.indexOf(n) >= 0) {
+        if (!partial || n.length > String(partial.name).replace(/\s+/g, '').length) partial = s;
+      }
+    }
+    return exact || partial;
+  }
+
+  function fmtNum(n) {
+    const v = Number(n);
+    return Number.isInteger(v) ? String(v) : String(Math.round(v * 10) / 10);
+  }
+
+  function levelTone(level) {
+    const s = String(level || '');
+    if (s.indexOf('极慢') >= 0) return 'slow';
+    if (s.indexOf('缓慢') >= 0) return 'care';
+    return 'normal';
+  }
+
+  /**
+   * 规范参照时间：把规范里的「推荐溶媒用量区间 + 输注时间区间」按当前含量换算
+   * - 含量落在推荐用量区间内：按区间线性插值（100-250ml → 30-60min，则 250ml 得 60min）
+   * - 含量落在区间外：按中位容量比例折算，并提示核对
+   * - 单一容量（成品 / 固定溶媒）：按含量与规范容量比例折算
+   */
+  function specReference(spec, ml) {
+    if (!spec) return null;
+    const tMin = Number(spec.timeMin);
+    const tMax = Number.isFinite(Number(spec.timeMax)) ? Number(spec.timeMax) : tMin;
+    if (!Number.isFinite(tMin)) return null;
+
+    const vMin = Number(spec.volMin);
+    const vMax = Number.isFinite(Number(spec.volMax)) ? Number(spec.volMax) : vMin;
+    const open = !!spec.timeOpen;
+    const volume = Number(ml);
+
+    let minutes;
+    let scope;
+    if (!Number.isFinite(vMin) || !(volume > 0)) {
+      minutes = open ? tMin : Math.round((tMin + tMax) / 2);
+      scope = 'time-only';
+    } else if (vMax > vMin && volume >= vMin && volume <= vMax) {
+      minutes = Math.round(tMin + ((volume - vMin) / (vMax - vMin)) * (tMax - tMin));
+      scope = 'in-range';
+    } else {
+      const capMid = (vMin + vMax) / 2;
+      const tMid = (tMin + tMax) / 2;
+      minutes = Math.round(tMid * (volume / capMid));
+      scope = 'out-range';
+    }
+
+    minutes = Math.max(1, minutes);
+    return {
+      minutes: minutes,
+      open: open,
+      scope: scope,
+      text: (open ? '≥ ' : '约 ') + minutes + ' 分钟',
+    };
+  }
+
+  /* ---------------- 自定义滑动选择器（shadcn Select 风格） ---------------- */
+
+  const ICON_CLOSE =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+  const ICON_CHECK =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.8 12.6l4.6 4.6L19.4 6.6"/></svg>';
+
+  const PICKERS = {
+    drug: {
+      title: '选择药品 · 静脉输液规范',
+      get: () => $('#f-name').value.trim(),
+      set: (v) => { $('#f-name').value = v; },
+      view: (v) => (v ? v : '从规范库选择'),
+      options: () =>
+        SPECS.map((s) => ({
+          value: s.name,
+          label: s.name,
+          hint: [s.spec, s.timeText].filter(Boolean).join(' · '),
+          group: s.cls || '其他抗菌药物',
+        })),
+    },
+    factor: {
+      title: '滴系数（滴/ml）',
+      get: () => $('#f-factor').value,
+      set: (v) => { $('#f-factor').value = v; },
+      view: (v) => String(v),
+      options: () => [
+        { value: '15', label: '15 滴/ml', hint: '小儿 / 精密输液器常见' },
+        { value: '20', label: '20 滴/ml', hint: '常规输液器（默认）' },
+        { value: '60', label: '60 滴/ml', hint: '微量泵 / 精密过滤' },
+      ],
+    },
+    duration: {
+      title: '参考时长',
+      get: () => $('#f-duration').value,
+      set: (v) => { $('#f-duration').value = v; },
+      view: (v) => (DURATIONS.indexOf(Number(v)) >= 0 ? v + ' 分钟' : v + ' 分钟（规范参照）'),
+      options: () =>
+        DURATIONS.map((m) => ({
+          value: String(m),
+          label: m + ' 分钟',
+          hint: m <= 30 ? '短时输注' : m >= 90 ? '延长输注' : '',
+        })),
+    },
+    alert: {
+      title: '提前提醒',
+      get: () => $('#f-alert').value,
+      set: (v) => { $('#f-alert').value = v; },
+      view: (v) => '还剩 ' + v + ' 分钟时提醒我',
+      options: () =>
+        ALERTS.map((m) => ({
+          value: String(m),
+          label: '还剩 ' + m + ' 分钟',
+          hint: m <= 3 ? '更贴近到点' : m >= 10 ? '预留备药时间' : '',
+        })),
+    },
+  };
+
+  let activePicker = null;
+  let pickerBound = false;
+
+  function pickerOptionHtml(o, current) {
+    const selected = String(o.value) === String(current);
+    return (
+      '<button type="button" class="picker-item' + (selected ? ' is-selected' : '') + '"' +
+      ' data-value="' + esc(o.value) + '" role="option" aria-selected="' + (selected ? 'true' : 'false') + '">' +
+      '<span class="picker-item-body">' +
+      '<span class="picker-item-label">' + esc(o.label) + '</span>' +
+      (o.hint ? '<small class="picker-item-hint">' + esc(o.hint) + '</small>' : '') +
+      '</span>' +
+      '<span class="picker-item-check">' + ICON_CHECK + '</span>' +
+      '</button>'
+    );
+  }
+
+  function openPicker(key, trigger) {
+    const cfg = PICKERS[key];
+    if (!cfg) return;
+    const root = $('#picker-root');
+
+    // 再点同一个触发按钮 = 收起面板（避免连点造成开/关动画叠加）
+    if (!root.hidden && activePicker && activePicker.key === key && activePicker.trigger === trigger) {
+      closePicker(false);
+      return;
+    }
+    closePicker(true);
+    root.classList.remove('is-open', 'is-closing');
+
+    const current = cfg.get();
+    const groups = [];
+    cfg.options().forEach((o) => {
+      const name = o.group || '';
+      const last = groups[groups.length - 1];
+      if (!last || last.name !== name) groups.push({ name: name, items: [o] });
+      else last.items.push(o);
+    });
+
+    root.hidden = false;
+    root.innerHTML =
+      '<div class="picker-sheet" role="dialog" aria-modal="true">' +
+      '<span class="picker-grabber" aria-hidden="true"></span>' +
+      '<div class="picker-head">' +
+      '<span class="picker-title">' + esc(cfg.title) + '</span>' +
+      '<button type="button" class="picker-close" aria-label="关闭">' + ICON_CLOSE + '</button>' +
+      '</div>' +
+      '<div class="picker-list" role="listbox">' +
+      groups
+        .map(
+          (g) =>
+            (g.name ? '<div class="picker-group">' + esc(g.name) + '</div>' : '') +
+            g.items.map((o) => pickerOptionHtml(o, current)).join('')
+        )
+        .join('') +
+      '</div>' +
+      '<div class="picker-foot"><span class="picker-hint">上下滑动选择</span></div>' +
+      '</div>';
+
+    void root.offsetHeight; // 强制回流，保证收起态先落地，过渡才能正常播放
+    root.classList.add('is-open');
+
+    if (!pickerBound) {
+      pickerBound = true;
+      root.addEventListener('click', onPickerClick);
+    }
+    activePicker = { key: key, trigger: trigger || null };
+    if (trigger) trigger.setAttribute('aria-expanded', 'true');
+
+    // 打开时把当前选中项滚到列表中间，形成「定位到当前值」的滑动手感
+    const centerSelected = () => {
+      const list = $('.picker-list', root);
+      const sel = $('.picker-item.is-selected', root);
+      if (!list || !sel) return;
+      list.scrollTop = Math.max(0, sel.offsetTop - list.clientHeight / 2 + sel.offsetHeight / 2);
+    };
+    window.requestAnimationFrame(centerSelected);
+    window.setTimeout(centerSelected, 140); // 兜底：等面板过渡完成后再定位一次
+  }
+
+  function onPickerClick(e) {
+    const root = $('#picker-root');
+    if (!activePicker) return;
+    if (e.target.closest('.picker-close')) { closePicker(false); return; }
+
+    const item = e.target.closest('.picker-item');
+    if (item) {
+      const cfg = PICKERS[activePicker.key];
+      if (cfg && cfg.set) cfg.set(item.getAttribute('data-value'));
+      $$('.picker-item', root).forEach((el) => {
+        const on = el === item;
+        el.classList.toggle('is-selected', on);
+        el.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      vibrate(false);
+      window.setTimeout(() => {
+        closePicker(false);
+        syncForm();
+      }, 170); // 留出选中反馈时间再收起面板
+      return;
+    }
+    if (e.target === root) closePicker(false);
+  }
+
+  function closePicker(immediate) {
+    const root = $('#picker-root');
+    if (!root) return;
+    const sheet = $('.picker-sheet', root);
+    const finish = () => {
+      if (activePicker && activePicker.trigger) activePicker.trigger.setAttribute('aria-expanded', 'false');
+      activePicker = null;
+      root.classList.remove('is-open', 'is-closing');
+      root.hidden = true;
+      root.innerHTML = '';
+    };
+    if (root.hidden) {
+      activePicker = null;
+      root.classList.remove('is-open', 'is-closing');
+      return;
+    }
+    if (immediate || !sheet) { finish(); return; }
+    root.classList.add('is-closing'); // 面板下滑 + 遮罩淡出
+    window.setTimeout(finish, 210);
+  }
+
+  /** 表单视图同步：选择器文本 + 自动参考时长 + 规范参照 */
+  function syncForm() {
+    Object.keys(PICKERS).forEach((key) => {
+      const el = document.getElementById('view-' + key);
+      if (el) el.textContent = PICKERS[key].view(PICKERS[key].get());
+    });
+    syncAutoDuration();
+    renderSpecRef();
+  }
+
+  /* ---------------- 输液规范参照展示 ---------------- */
+
+  function renderSpecRef() {
+    const wrap = $('#spec-ref');
+    const spec = findSpec($('#f-name').value);
+    if (!spec) {
+      wrap.hidden = true;
+      return;
+    }
+
+    const mlRaw = Number($('#f-ml').value);
+    const hasMl = Number.isFinite(mlRaw) && mlRaw > 0;
+    const capMid = (Number(spec.volMin) + Number(spec.volMax)) / 2;
+    const useMl = hasMl ? mlRaw : capMid;
+    const ref = specReference(spec, useMl);
+    const rate = Number($('#f-rate').value);
+    const hasRate = Number.isFinite(rate) && rate > 0;
+
+    wrap.hidden = false;
+    const levelEl = $('#spec-ref-level');
+    levelEl.textContent = spec.level || '规范';
+    levelEl.setAttribute('data-tone', levelTone(spec.level));
+
+    $('#spec-ref-time').textContent = ref ? ref.text : '—';
+    $('#spec-ref-cap').textContent = hasMl
+      ? '当前含量 ' + fmtNum(useMl) + ' ml 对应'
+      : '按规范容量 ' + fmtNum(capMid) + ' ml 估算，填总量后重算';
+
+    const rows = [
+      ['药物分类', spec.cls || '—'],
+      ['常用规格', spec.spec || '—'],
+      ['推荐溶媒', spec.solvent || '—'],
+      ['推荐滴速', spec.rateText ? spec.rateText + ' 滴/分' : '—'],
+      ['规范输注', spec.timeText || '—'],
+    ];
+    $('#spec-ref-grid').innerHTML = rows
+      .map((r) => '<div class="spec-ref-row"><span>' + esc(r[0]) + '</span><b>' + esc(r[1]) + '</b></div>')
+      .join('');
+
+    const note = $('#spec-ref-note');
+    note.hidden = !spec.note;
+    note.textContent = spec.note ? '注意事项：' + spec.note : '';
+
+    const warns = [];
+    if (
+      hasMl && Number(spec.volMax) > Number(spec.volMin) &&
+      (useMl < Number(spec.volMin) - 0.5 || useMl > Number(spec.volMax) + 0.5)
+    ) {
+      warns.push('总量 ' + fmtNum(useMl) + ' ml 不在规范推荐溶媒用量（' + spec.solvent + '）内，请核对');
+    }
+    if (
+      hasRate && Number(spec.rateMin) > 0 &&
+      (rate < Number(spec.rateMin) - 0.5 || rate > Number(spec.rateMax) + 0.5)
+    ) {
+      warns.push('滴速 ' + rate + ' 滴/分 超出规范推荐 ' + spec.rateText + ' 滴/分，建议复核');
+    }
+    const warnEl = $('#spec-ref-warn');
+    warnEl.hidden = warns.length === 0;
+    warnEl.innerHTML = warns.map((w) => '⚠️ ' + esc(w)).join('<br />');
+
+    // 一键动作：没填滴速时套用参照时长，填了滴速时套用规范推荐滴速
+    const apply = $('#spec-ref-apply');
+    apply.hidden = !ref;
+    if (ref) {
+      if (hasRate) {
+        const mid = Math.round((Number(spec.rateMin) + Number(spec.rateMax)) / 2);
+        apply.textContent = '填入规范推荐滴速（' + mid + ' 滴/分）';
+        apply.setAttribute('data-kind', 'rate');
+        apply.setAttribute('data-value', String(mid));
+      } else {
+        apply.textContent = '采用规范参照时长（' + ref.minutes + ' 分钟）';
+        apply.setAttribute('data-kind', 'minutes');
+        apply.setAttribute('data-value', String(ref.minutes));
+      }
+    }
+  }
+
+  function applySpecRef() {
+    const btn = $('#spec-ref-apply');
+    const kind = btn.getAttribute('data-kind');
+    const value = btn.getAttribute('data-value');
+    if (!value) return;
+    if (kind === 'minutes') {
+      $('#f-duration').value = value;
+      showToast('已采用规范参照时长 ' + value + ' 分钟', true);
+    } else {
+      $('#f-rate').value = value;
+      showToast('已填入规范推荐滴速 ' + value + ' 滴/分', true);
+    }
+    vibrate(false);
+    syncForm();
+  }
+
+  function resetForm() {
+    $('#f-name').value = '';
+    $('#f-ml').value = '';
+    $('#f-rate').value = '';
+    $('#f-factor').value = '20';
+    $('#f-duration').value = '60';
+    $('#f-alert').value = '5';
+    submitting = false;
+    syncForm();
+  }
+
+  /** 滴速有值时：自动算参考时长并替换手动时长选择 */
+  function syncAutoDuration() {
+    const ml = Number($('#f-ml').value);
+    const rate = Number($('#f-rate').value);
+    const factor = Number($('#f-factor').value);
+    const minutes = calcMinutes(ml, factor, rate);
+
+    const tip = $('#rate-tip');
+    const auto = $('#auto-duration');
+    const card = $('#f-duration-card');
+
+    if (minutes) {
+      tip.hidden = false;
+      tip.textContent = '⏱️ 自动算出参考时长：约 ' + minutes + ' 分钟（仅供参考，可随时结束）';
+      auto.hidden = false;
+      auto.textContent = '⏱️ 约 ' + minutes + ' 分钟（按 ' + ml + 'ml × ' + factor + ' ÷ ' + rate + ' 自动计算）';
+      card.hidden = true;
+      card.classList.add('field-card--auto');
+    } else {
+      tip.hidden = true;
+      auto.hidden = true;
+      card.hidden = false;
+      card.classList.remove('field-card--auto');
+    }
+  }
+
+  async function onCreate() {
+    if (submitting) return; // 防重复提交
+    const name = $('#f-name').value.trim();
+    const ml = Number($('#f-ml').value);
+    const rate = Number($('#f-rate').value);
+    const factor = Number($('#f-factor').value);
+    const hasRate = Number.isFinite(rate) && rate > 0;
+
+    if (!name) {
+      showToast('请输入或从规范库选择药品名称');
+      return;
+    }
+    if (!Number.isFinite(ml) || ml <= 0) {
+      showToast('请输入正确的总量(ml)');
+      return;
+    }
+
+    const minutes = hasRate
+      ? Math.max(1, Math.round((ml * factor) / rate))
+      : Number($('#f-duration').value);
+    const alertMin = Number($('#f-alert').value);
+    const label = nextLabel(name);
+
+    // 规范参照：命中规范库时随任务一起保存，卡片可回看
+    const spec = findSpec(name);
+    const ref = spec ? specReference(spec, ml) : null;
+
+    const ok = await showModal({
+      title: '确认创建',
+      content:
+        '药品：' + label +
+        '\n总量：' + ml + 'ml · 滴系数：' + factor + (hasRate ? ' · 滴速：' + rate + '滴/分' : '') +
+        '\n参考时长：约' + minutes + '分钟（仅供参考，可随时结束）' +
+        (spec
+          ? '\n规范参照：' + (ref ? ref.text : spec.timeText) +
+            '（规范 ' + spec.timeText + ' · ' + (spec.level || '规范') + '）'
+          : ''),
+      confirmText: '确认',
+      cancelText: '取消',
+    });
+    if (!ok) return;
+
+    submitting = true;
+    try {
+      addTask({
+        label: label,
+        manufacturer: '', // 已改为输液规范参照，不再记录厂家
+        totalMl: ml,
+        dripFactor: factor,
+        dripRate: hasRate ? rate : undefined,
+        expectedMin: minutes,
+        alertMin: alertMin,
+        specRef: spec
+          ? {
+              name: spec.name,
+              cls: spec.cls,
+              level: spec.level,
+              specText: spec.spec,
+              solvent: spec.solvent,
+              rateText: spec.rateText,
+              timeText: spec.timeText,
+              refMin: ref ? ref.minutes : null,
+              refOpen: ref ? ref.open : false,
+            }
+          : undefined,
+      });
+      showToast('已创建', true);
+      window.setTimeout(() => { location.hash = '#/'; }, 400);
+    } finally {
+      submitting = false;
+    }
+  }
+
+  function bindAdd() {
+    $('#btn-back').addEventListener('click', () => { location.hash = '#/'; });
+    $('#btn-create').addEventListener('click', onCreate);
+
+    // 四个自定义滑动选择器（药品名称 / 滴系数 / 参考时长 / 提前提醒）
+    $$('[data-picker]').forEach((btn) => {
+      btn.addEventListener('click', () => openPicker(btn.getAttribute('data-picker'), btn));
+    });
+
+    // 手动输入药名 / 总量 / 滴速：同步选择器文本、自动时长与规范参照
+    ['#f-name', '#f-ml', '#f-rate'].forEach((sel) => {
+      $(sel).addEventListener('input', syncForm);
+    });
+
+    $('#spec-ref-apply').addEventListener('click', applySpecRef);
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && activePicker) closePicker(false);
+    });
+  }
+
+  /* ============================================================
+   * 五、路由 / 时钟 / 提醒
+   * ============================================================ */
+
+  function route() {
+    const isAdd = location.hash.indexOf('#/add') === 0;
+    $('#view-monitor').hidden = isAdd;
+    $('#view-add').hidden = !isAdd;
+    if (isAdd) resetForm();
+    else renderMonitor();
+  }
+
+  /** 秒级刷新 + 参考提醒（预计时间仅供参考，每瓶只提醒一次，不做严格限制） */
+  function tick() {
+    updateLive();
+    const t = Date.now();
+    for (const task of state.tasks) {
+      if (task.status !== 'running') continue;
+      const rem = remainingMs(task, t);
+      if (rem <= task.alertMin * 60 * 1000 && !state.alerted.has(task.id)) {
+        state.alerted.add(task.id);
+        vibrate(false);
+        const msg = rem <= 0
+          ? task.label + ' 已超参考时长 ' + fmtHuman(-rem)
+          : task.label + ' 参考剩余约 ' + fmtHuman(rem);
+        showToast('🔔 ' + msg);
+        pushNotify('🔔 输注提醒', msg);
+      }
+    }
+  }
+
+  /**
+   * 补报离开期间错过的提醒：
+   * 计时基于绝对时间戳，关页面/切后台不影响准确性。
+   */
+  function catchUp() {
+    reload();
+    const t = Date.now();
+    const missed = state.tasks.filter((task) => {
+      if (task.status !== 'running') return false;
+      const rem = remainingMs(task, t);
+      const hit = rem <= task.alertMin * 60 * 1000;
+      if (hit) state.alerted.add(task.id);
+      return hit;
+    });
+    if (missed.length > 0) {
+      vibrate(true);
+      const lines = missed.map((task) => {
+        const rem = remainingMs(task, t);
+        return rem <= 0
+          ? task.label + ' 已超参考时长 ' + fmtHuman(-rem)
+          : task.label + ' 参考剩余约 ' + fmtHuman(rem);
+      });
+      pushNotify('🔔 输注提醒', lines.join('\n'));
+      showModal({
+        title: '🔔 输注提醒',
+        content: lines.join('\n'),
+        confirmText: '知道了',
+        showCancel: false,
+      });
+    }
+  }
+
+  /* ---------------- 启动 ---------------- */
+
+  function boot() {
+    bindMonitor();
+    bindAdd();
+    syncNotifyButton();
+    window.addEventListener('hashchange', route);
+    route();
+
+    // 回到页面时补报离开期间错过的参考提醒
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        const isAdd = location.hash.indexOf('#/add') === 0;
+        if (!isAdd) renderMonitor();
+        catchUp();
+      }
+    });
+
+    window.setInterval(() => {
+      if (document.hidden) return;
+      tick();
+    }, 1000);
+
+    if (!document.hidden) catchUp();
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})();
