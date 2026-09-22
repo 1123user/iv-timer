@@ -519,6 +519,38 @@ svg { width: 100%; height: 100%; display: block; }
   font-weight: 500;
 }
 .modal-btn--primary { background: var(--primary); color: var(--primary-foreground); font-weight: 600; }
+
+/* 提醒设置面板 */
+.modal--settings { max-width: 360px; text-align: left; }
+.set-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 14px;
+  font-size: 13.5px;
+}
+.set-row b { flex: none; font-size: 12.5px; font-weight: 600; color: var(--muted-foreground); }
+.set-wide { width: 100%; margin-top: 10px; }
+.set-label { display: block; margin: 10px 0 6px; font-size: 12px; color: var(--muted-foreground); }
+.set-input {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+  font-size: 14px;
+  outline: none;
+}
+.set-input:focus { border-color: var(--primary); }
+.set-actions { display: flex; gap: 8px; margin-top: 10px; }
+.set-hint {
+  margin: 10px 0 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--muted-foreground);
+}
+.set-hint.is-ok { color: var(--success); }
 .modal-btn--danger { background: var(--destructive); color: var(--destructive-foreground); font-weight: 600; }
 .modal-btn:active { opacity: 0.88; }
 

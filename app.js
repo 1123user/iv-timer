@@ -355,7 +355,7 @@
     const btn = $('#btn-notify');
     const text = $('#notify-text');
     if (!btn) return;
-    const on = alertReady();
+    const on = alertReady() || ntfyConfig().enabled; // 远程推送也算已开启
     btn.classList.toggle('is-on', on);
     if (text) {
       if (on) text.textContent = '提醒已开启';
@@ -720,6 +720,11 @@
   }
 
   function nextAlarm() {
+    // 只响「仍在输液」的任务，避免排队的任务已被结束/删除后还响
+    alarm.list = alarm.list.filter((t) => {
+      const live = state.tasks.find((x) => x.id === t.id);
+      return !!live && live.status === 'running';
+    });
     alarm.current = alarm.list.shift() || null;
     if (!alarm.current) {
       stopRing();
@@ -796,10 +801,189 @@
   }
 
   /* ============================================================
+   * 二.6、远程推送（ntfy.sh，开源）
+   * ------------------------------------------------------------
+   * 彻底关掉网页也能收到提醒：开始输液时把「到点时刻 + 药名」投递给
+   * ntfy 服务器（X-At 定时投递），由它到点推送到手机的 ntfy App。
+   * 结束/删除任务时用同一个 sequence id 发送 DELETE，撤销定时消息，
+   * 保证不会在任务结束后还收到（或残留）提醒。
+   * 只上传药名与时间，不含患者信息。
+   * ============================================================ */
+
+  const NTFY_KEY = 'iv_ntfy';
+  const NTFY_BASE = 'https://ntfy.sh';
+
+  function ntfyConfig() {
+    const raw = lsGet(NTFY_KEY, null);
+    const topic = raw && typeof raw.topic === 'string' ? raw.topic : '';
+    return { enabled: !!(raw && raw.enabled && topic), topic: topic };
+  }
+
+  function setNtfyConfig(patch) {
+    lsSet(NTFY_KEY, Object.assign(ntfyConfig(), patch));
+  }
+
+  function genTopic() {
+    return 'iv-timer-' + Math.random().toString(36).slice(2, 8);
+  }
+
+  function b64Utf8(str) {
+    let bin = '';
+    new TextEncoder().encode(str).forEach((b) => { bin += String.fromCharCode(b); });
+    return btoa(bin);
+  }
+
+  /** 非 ASCII 标题按 RFC 2047 编码（ntfy 支持） */
+  function ntfyHeader(str) {
+    return /^[\x20-\x7E]*$/.test(str) ? str : '=?UTF-8?B?' + b64Utf8(str) + '?=';
+  }
+
+  function ntfySeq(taskId) {
+    return 'iv-' + taskId;
+  }
+
+  function appUrl() {
+    return location.origin + location.pathname;
+  }
+
+  /** 预约到点推送：X-At 定时投递（服务端限制 10 秒 ~ 3 天） */
+  function scheduleRemoteAlarm(task) {
+    const cfg = ntfyConfig();
+    if (!cfg.enabled || !task || !task.startTs) return;
+    const at = task.startTs + task.expectedMin * 60 * 1000;
+    if (at - Date.now() < 15000) return; // 太近就不发了
+    fetch(NTFY_BASE + '/' + encodeURIComponent(cfg.topic) + '/' + encodeURIComponent(ntfySeq(task.id)), {
+      method: 'POST',
+      headers: {
+        'X-Title': ntfyHeader('⏰ ' + task.label + ' 参考时长已到'),
+        'X-Priority': '5',
+        'X-Tags': 'alarm_clock,hospital',
+        'X-Click': appUrl(),
+        'X-At': String(Math.floor(at / 1000)),
+      },
+      body: task.label + ' 参考 ' + task.expectedMin + ' 分钟已到，请查看输注情况（若已结束请忽略）',
+    })
+      .then(() => showToast('已预约远程提醒（关掉网页也会推送）', true))
+      .catch(() => showToast('远程提醒预约失败，请检查网络或 topic'));
+  }
+
+  /** 撤销预约：同 sequence id 的定时消息会被服务端删除，永不投递 */
+  function cancelRemoteAlarm(taskId) {
+    const cfg = ntfyConfig();
+    if (!cfg.enabled || !taskId) return;
+    fetch(NTFY_BASE + '/' + encodeURIComponent(cfg.topic) + '/' + encodeURIComponent(ntfySeq(taskId)), {
+      method: 'DELETE',
+    }).catch(() => {});
+  }
+
+  function testRemoteAlarm(topic) {
+    return fetch(NTFY_BASE + '/' + encodeURIComponent(topic), {
+      method: 'POST',
+      headers: {
+        'X-Title': ntfyHeader('✅ 输液计时器 · 测试推送'),
+        'X-Priority': '4',
+        'X-Tags': 'white_check_mark,hospital',
+        'X-Click': appUrl(),
+      },
+      body: '看到这条通知，说明远程提醒配置成功。到点时同样会推送。',
+    });
+  }
+
+  /* ---------------- 提醒设置面板 ---------------- */
+
+  function showAlertSettings() {
+    const root = $('#modal-root');
+    const cfg = ntfyConfig();
+    const topic = cfg.topic || genTopic();
+
+    root.hidden = false;
+    root.innerHTML =
+      '<div class="modal modal--settings" role="dialog" aria-modal="true">' +
+      '<h2>提醒设置</h2>' +
+      '<div class="set-row"><span>响铃与系统通知</span><b id="set-alert-state">' + (alertReady() ? '已开启' : '未开启') + '</b></div>' +
+      '<button type="button" class="modal-btn modal-btn--primary set-wide" data-set="enable">' +
+      (alertReady() ? '试听铃声' : '开启响铃与通知') +
+      '</button>' +
+      '<p class="set-hint">响铃在页面打开时最可靠（已加静音保活，切后台/锁屏仍会响）；彻底关掉网页时用下面的远程推送兜底。</p>' +
+      '<div class="set-row"><span>远程推送 · ntfy.sh</span><b id="set-ntfy-state">' + (cfg.enabled ? '已开启' : '未开启') + '</b></div>' +
+      '<label class="set-label" for="set-topic">topic（手机 ntfy App 订阅同一个）</label>' +
+      '<input class="set-input" id="set-topic" type="text" spellcheck="false" autocomplete="off" value="' + esc(topic) + '" />' +
+      '<div class="set-actions">' +
+      '<button type="button" class="modal-btn" data-set="ntfy-on">保存并测试</button>' +
+      '<button type="button" class="modal-btn" data-set="ntfy-off">关闭远程推送</button>' +
+      '</div>' +
+      '<p class="set-hint" id="set-msg">手机装 ntfy App → 订阅该 topic，关掉网页也能收到到点推送。只上传药名与时间，不含患者信息。</p>' +
+      '<button type="button" class="modal-btn modal-btn--primary set-wide" data-set="close">完成</button>' +
+      '</div>';
+
+    const close = () => {
+      root.onclick = null;
+      root.hidden = true;
+      root.innerHTML = '';
+    };
+    const msg = (text, ok) => {
+      const el = $('#set-msg');
+      if (el) {
+        el.textContent = text;
+        el.classList.toggle('is-ok', !!ok);
+      }
+      if (ok) showToast(text, true);
+    };
+
+    root.onclick = async (e) => {
+      const btn = e.target.closest('[data-set]');
+      if (!btn) {
+        if (e.target === root) close();
+        return;
+      }
+      const act = btn.getAttribute('data-set');
+
+      if (act === 'close') { close(); return; }
+
+      if (act === 'enable') {
+        await enableAlert();
+        const stateEl = $('#set-alert-state');
+        if (stateEl) stateEl.textContent = alertReady() ? '已开启' : '未开启';
+        btn.textContent = alertReady() ? '试听铃声' : '开启响铃与通知';
+        return;
+      }
+
+      if (act === 'ntfy-on') {
+        const input = $('#set-topic');
+        const t = (input ? input.value : '').trim().toLowerCase();
+        if (!/^[a-z0-9_-]{3,64}$/.test(t)) {
+          msg('topic 只能用小写字母、数字、- 和 _（3~64 位）');
+          return;
+        }
+        setNtfyConfig({ enabled: true, topic: t });
+        msg('正在发送测试推送…');
+        try {
+          await testRemoteAlarm(t);
+          msg('已开启：手机应能收到测试推送（topic: ' + t + '）', true);
+          const st = $('#set-ntfy-state');
+          if (st) st.textContent = '已开启';
+        } catch (err) {
+          msg('发送失败，请检查网络后重试');
+        }
+        return;
+      }
+
+      if (act === 'ntfy-off') {
+        setNtfyConfig({ enabled: false });
+        const st = $('#set-ntfy-state');
+        if (st) st.textContent = '未开启';
+        msg('已关闭远程推送');
+      }
+    };
+  }
+
+  /* ============================================================
    * 三、监护台视图
    * ============================================================ */
 
   const PAGE_SIZE = 8; // 病区药品多时分页浏览
+
+  const RINGED_KEY = 'iv_ringed'; // 到点响铃标记（持久化：重开页面不再重复响）
 
   const state = {
     tasks: [],
@@ -807,8 +991,18 @@
     page: 0,
     expandId: null,
     alerted: new Set(), // 提前提醒（每个任务一次）
-    ringed: new Set(),  // 到点响铃（每个任务一次，重新开始计时会重置）
+    ringed: new Set(lsGet(RINGED_KEY, [])), // 到点响铃（每个任务一次，持久化防重复）
   };
+
+  function markRinged(id) {
+    state.ringed.add(id);
+    lsSet(RINGED_KEY, Array.from(state.ringed));
+  }
+
+  function unmarkRinged(id) {
+    state.ringed.delete(id);
+    lsSet(RINGED_KEY, Array.from(state.ringed));
+  }
 
   const ICON_CHEVRON_DOWN =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
@@ -878,6 +1072,16 @@
       $('#pager-info').textContent = (state.page + 1) + ' / ' + pageCount;
       $('[data-page="prev"]', pager).disabled = state.page <= 0;
       $('[data-page="next"]', pager).disabled = state.page >= pageCount - 1;
+    }
+
+    // 兜底：已结束 / 已删除的任务不应保留响铃或排队
+    alarm.list = alarm.list.filter((t) => {
+      const live = state.tasks.find((x) => x.id === t.id);
+      return !!live && live.status === 'running';
+    });
+    if (alarm.current) {
+      const live = state.tasks.find((x) => x.id === alarm.current.id);
+      if (!live || live.status !== 'running') stopAlarm();
     }
 
     updateLive();
@@ -1039,10 +1243,11 @@
     }
     vibrate(true);
     // 重新开始计时：重置该任务的提醒状态
-    state.ringed.delete(result.id);
+    unmarkRinged(result.id);
     state.alerted.delete('pre:' + result.id);
     keepAllowed = true;
     syncKeepAlive(); // 开始输液 → 启动后台保活（切后台/锁屏也能响）
+    scheduleRemoteAlarm(result); // 预约远程推送（关掉网页也能收到）
     const willFinishAt = result.startTs + result.expectedMin * 60 * 1000;
     await showModal({
       title: '✅ 已开始输注',
@@ -1070,9 +1275,13 @@
       return;
     }
     vibrate(true);
+    reload(); // 先让内存状态与磁盘一致，否则定时器会用过期状态重新触发响铃
     clearAlarmFor(result.id); // 结束输液即停止该任务的响铃
+    unmarkRinged(result.id);
+    cancelRemoteAlarm(result.id); // 撤销已预约的远程推送
     // 任务结束后：日历提醒视为完成，自动生成取消文件删除对应提醒
     downloadIcs(result, true);
+    renderMonitor(); // 立即刷新列表，不等弹窗关闭
     await showModal({
       title: '✅ 本瓶输注完成',
       content:
@@ -1094,7 +1303,10 @@
     });
     if (!ok) return;
     clearAlarmFor(task.id);
+    unmarkRinged(task.id);
+    cancelRemoteAlarm(task.id); // 删除即撤销远程推送
     removeTask(task.id);
+    reload();
     if (state.expandId === task.id) state.expandId = null;
     renderMonitor();
   }
@@ -1111,7 +1323,9 @@
         '5. 有药品正在输液时会保持一路静音播放（锁屏可见播放控制），\n' +
         '   让切后台/锁屏后仍能响铃；若彻底关闭本页面则无法响铃，\n' +
         '   可提前点「到点提醒我」导出日历做后台兜底\n' +
-        '6. 建议「添加到主屏幕」后使用，响铃与保活更稳定\n' +
+        '6. 想「彻底关掉网页也能收到」，点右上角「提醒设置」填一个 ntfy topic，\n' +
+        '   手机装 ntfy App 订阅同一 topic，到点由服务器推送（只上传药名与时间）\n' +
+        '7. 建议「添加到主屏幕」后使用，响铃与保活更稳定\n' +
         '预计时长仅供参考，可随时结束。',
       confirmText: '知道了',
       showCancel: false,
@@ -1132,7 +1346,7 @@
       renderMonitor();
     });
 
-    $('#btn-notify').addEventListener('click', enableAlert);
+    $('#btn-notify').addEventListener('click', showAlertSettings);
     $('#btn-help').addEventListener('click', showHelp);
 
     // 响铃面板
@@ -1720,12 +1934,23 @@
 
       // ② 到点闹钟：循环响铃 + 震动 + 全屏「停止响铃」
       if (rem <= 0 && !state.ringed.has(task.id) && snoozeReady(task)) {
-        state.ringed.add(task.id);
+        // 二次确认：以磁盘状态为准，杜绝「任务已结束却仍在响铃」
+        const fresh = loadTasks().find((x) => x.id === task.id);
+        if (!fresh || fresh.status !== 'running') {
+          unmarkRinged(task.id);
+          continue;
+        }
+        markRinged(task.id);
         startAlarm(task);
       }
     }
 
-    if (alarm.current) renderAlarmPanel(); // 响铃面板时间每秒走动
+    // 正在响铃的任务若已结束或被删除 → 立刻停响（绝不留残留铃声）
+    if (alarm.current) {
+      const live = state.tasks.find((x) => x.id === alarm.current.id);
+      if (!live || live.status !== 'running') stopAlarm();
+      else renderAlarmPanel(); // 响铃面板时间每秒走动
+    }
     syncKeepAlive(); // 跟随「有药品正在输液」状态启停保活
   }
 
@@ -1758,7 +1983,7 @@
 
       // 离开期间已到点的：回到页面立即响铃
       if (rem <= 0 && !state.ringed.has(task.id) && snoozeReady(task)) {
-        state.ringed.add(task.id);
+        markRinged(task.id);
         startAlarm(task);
       }
     }
