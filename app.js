@@ -334,11 +334,24 @@
 
   const ALARM_KEY = 'iv_alarm_pref';
 
+  /** 音量档位（响铃面板/设置里循环切换） */
+  const ALARM_VOLUMES = [
+    { value: 1, label: '最大' },
+    { value: 0.9, label: '很大' },
+    { value: 0.8, label: '较大' },
+  ];
+
+  function volumeLabel(v) {
+    const hit = ALARM_VOLUMES.filter((x) => x.value === v)[0];
+    return hit ? hit.label : '最大';
+  }
+
   function alarmPref() {
     const raw = lsGet(ALARM_KEY, null);
     return {
-      sound: raw && ALARM_SOUNDS[raw.sound] ? raw.sound : 'classic',
-      volume: raw && Number.isFinite(raw.volume) ? raw.volume : 0.6,
+      sound: raw && ALARM_SOUNDS[raw.sound] ? raw.sound : 'alert',
+      // 旧版本默认 0.6 明显偏小：小于 0.8 的一律按最大音量起步
+      volume: raw && Number.isFinite(raw.volume) && raw.volume >= 0.8 ? raw.volume : 1,
     };
   }
 
@@ -449,10 +462,9 @@
    *   固有限制，因此保留 .ics 日历导出作为后台兜底
    * ============================================================ */
 
+  /* 只保留一种铃声：急促警报（方波连滴，最醒目、穿透力最强） */
   const ALARM_SOUNDS = {
-    classic: { label: '经典闹钟', wave: 'square', dur: 0.14, gap: 1.3, seq: [880, 0, 880, 0, 880] },
-    ward: { label: '病房提示', wave: 'sine', dur: 0.34, gap: 1.6, seq: [659.25, 987.77] },
-    urgent: { label: '急促警报', wave: 'triangle', dur: 0.09, gap: 0.95, seq: [1318.5, 0, 1318.5] },
+    alert: { label: '急促警报', wave: 'square', dur: 0.06, gap: 0.85, seq: [1568, 0, 1568, 0, 1568, 0, 1568, 0, 1568] },
   };
   const ALARM_AUTO_STOP_MS = 120000; // 无人处理时 2 分钟自动停止
 
@@ -486,7 +498,7 @@
     osc.type = wave;
     osc.frequency.setValueAtTime(freq, at);
     gain.gain.setValueAtTime(0.0001, at);
-    gain.gain.exponentialRampToValueAtTime(Math.max(0.02, vol), at + 0.012);
+    gain.gain.exponentialRampToValueAtTime(Math.max(0.02, Math.min(1, vol)), at + 0.012);
     gain.gain.exponentialRampToValueAtTime(0.0001, at + dur);
     osc.connect(gain);
     gain.connect(masterGain);
@@ -498,10 +510,10 @@
   function playRingBar(soundKey) {
     const ctx = ensureAudio();
     if (!ctx) return;
-    const s = ALARM_SOUNDS[soundKey] || ALARM_SOUNDS.classic;
+    const s = ALARM_SOUNDS[soundKey] || ALARM_SOUNDS.alert;
     const t0 = ctx.currentTime + 0.03;
     s.seq.forEach((f, i) => {
-      if (f > 0) playTone(ctx, f, t0 + i * (s.dur + 0.07), s.dur, s.wave, 0.5 * alarm.volume);
+      if (f > 0) playTone(ctx, f, t0 + i * (s.dur + 0.05), s.dur, s.wave, 0.95 * alarm.volume);
     });
   }
 
@@ -541,7 +553,7 @@
   /** 用与实时合成相同的音符参数，离线渲染「一遍铃声」为可循环的 WAV */
   function renderRingUrl(soundKey) {
     if (ringUrlCache[soundKey]) return ringUrlCache[soundKey];
-    const s = ALARM_SOUNDS[soundKey] || ALARM_SOUNDS.classic;
+    const s = ALARM_SOUNDS[soundKey] || ALARM_SOUNDS.alert;
     const sr = 8000;
     const dur = Math.max(0.9, s.gap);
     const len = Math.ceil(dur * sr);
@@ -552,16 +564,17 @@
       const to = Math.min(len, Math.floor((startSec + noteDur) * sr));
       for (let i = from; i < to; i++) {
         const t = (i - from) / sr;
-        const env = t < 0.012 ? t / 0.012 : Math.exp(-(t - 0.012) * (6 / Math.max(0.05, noteDur)));
+        const env = t < 0.01 ? t / 0.01 : Math.exp(-(t - 0.01) * (5 / Math.max(0.05, noteDur)));
         const ph = 2 * Math.PI * freq * t;
         let v;
-        if (s.wave === 'square') v = Math.sin(ph) > 0 ? 0.7 : -0.7;
+        if (s.wave === 'square') v = Math.sin(ph) > 0 ? 1 : -1;
         else if (s.wave === 'triangle') v = (2 / Math.PI) * Math.asin(Math.sin(ph));
         else v = Math.sin(ph);
-        pcm[i] += v * env * 0.55;
+        pcm[i] += v * env * 0.9; // 接近满刻度，响度最大化
       }
     };
-    s.seq.forEach((f, i) => { if (f > 0) tone(f, i * (s.dur + 0.07), s.dur); });
+    s.seq.forEach((f, i) => { if (f > 0) tone(f, i * (s.dur + 0.05), s.dur); });
+    for (let i = 0; i < len; i++) pcm[i] = Math.max(-1, Math.min(1, pcm[i])); // 限幅防爆音
 
     const url = URL.createObjectURL(encodeWav(pcm, sr));
     ringUrlCache[soundKey] = url;
@@ -648,7 +661,7 @@
 
   function startRing(soundKey) {
     stopRing();
-    const s = ALARM_SOUNDS[soundKey] || ALARM_SOUNDS.classic;
+    const s = ALARM_SOUNDS[soundKey] || ALARM_SOUNDS.alert;
 
     // ① 优先用 <audio> 走媒体通道（后台/锁屏可继续出声）
     const el = getRingAudio();
@@ -722,8 +735,7 @@
     if (icsBtn) icsBtn.hidden = isTest;
     $('#alarm-elapsed').textContent = fmtDuration(elapsed);
     $('#alarm-over').textContent = over > 0 ? fmtDuration(over) : '00:00';
-    const s = ALARM_SOUNDS[alarmPref().sound] || ALARM_SOUNDS.classic;
-    $('#alarm-sound').textContent = '铃声：' + s.label;
+    $('#alarm-sound').textContent = '音量：' + volumeLabel(alarmPref().volume);
   }
 
   function nextAlarm() {
@@ -775,15 +787,17 @@
     stopAlarm();
   }
 
-  function cycleAlarmSound() {
-    const keys = Object.keys(ALARM_SOUNDS);
-    const cur = alarmPref().sound;
-    const next = keys[(keys.indexOf(cur) + 1) % keys.length];
-    setAlarmPref({ sound: next });
-    alarm.volume = alarmPref().volume;
-    playRingBar(next); // 立即试听
+  /** 响铃面板音量按钮：循环切换档位并即时生效 */
+  function cycleAlarmVolume() {
+    const cur = alarmPref().volume;
+    const idx = ALARM_VOLUMES.map((x) => x.value).indexOf(cur);
+    const next = ALARM_VOLUMES[(idx + 1) % ALARM_VOLUMES.length].value;
+    setAlarmPref({ volume: next });
+    alarm.volume = next;
+    if (ringAudioEl) ringAudioEl.volume = next;
+    if (!ringAudioEl || ringAudioEl.paused) playRingBar(alarmPref().sound); // 没在响就试听一遍
     renderAlarmPanel();
-    showToast('铃声：' + ALARM_SOUNDS[next].label);
+    showToast('响铃音量：' + volumeLabel(next) + '（' + Math.round(next * 100) + '%）', true);
   }
 
   /** 贪睡未到期时不再自动响铃 */
@@ -966,6 +980,9 @@
       '<button type="button" class="modal-btn" data-set="ring-now">立即响铃测试</button>' +
       '<button type="button" class="modal-btn" data-set="sim-30">模拟 30 秒后到点</button>' +
       '</div>' +
+      '<div class="set-actions">' +
+      '<button type="button" class="modal-btn" data-set="volume">音量：' + volumeLabel(alarmPref().volume) + '</button>' +
+      '</div>' +
       '<div class="set-row"><span>远程推送 · ntfy.sh</span><b id="set-ntfy-state">' + (cfg.enabled ? '已开启' : '未开启') + '</b></div>' +
       '<label class="set-label" for="set-topic">topic（手机 ntfy App 订阅同一个）</label>' +
       '<input class="set-input" id="set-topic" type="text" spellcheck="false" autocomplete="off" value="' + esc(topic) + '" />' +
@@ -1004,6 +1021,12 @@
       if (act === 'ring-now') { close(); testRing(); return; }
 
       if (act === 'sim-30') { close(); simulateAlarm(30); return; }
+
+      if (act === 'volume') {
+        cycleAlarmVolume();
+        btn.textContent = '音量：' + volumeLabel(alarmPref().volume);
+        return;
+      }
 
       if (act === 'enable') {
         await enableAlert();
@@ -1378,7 +1401,7 @@
         '2. 点底部「+ 新增特殊药品」，选择或输入药名（勿填患者姓名）\n' +
         '3. 选中规范库药品后，会按当前含量给出参照输注时间\n' +
         '4. 按「开始输液」计时；参考时长到点后会像闹钟一样响铃，\n' +
-        '   响铃页可「停止响铃」「5 分钟后提醒」、或点「铃声」切换音色\n' +
+        '   响铃页可「停止响铃」「5 分钟后提醒」、或点「音量」调整响铃大小\n' +
         '5. 有药品正在输液时会保持一路静音播放（锁屏可见播放控制），\n' +
         '   让切后台/锁屏后仍能响铃；若彻底关闭本页面则无法响铃，\n' +
         '   可提前点「到点提醒我」导出日历做后台兜底\n' +
@@ -1411,7 +1434,7 @@
     // 响铃面板
     $('#alarm-stop').addEventListener('click', stopAlarm);
     $('#alarm-snooze').addEventListener('click', () => snoozeAlarm(5));
-    $('#alarm-sound').addEventListener('click', cycleAlarmSound);
+    $('#alarm-sound').addEventListener('click', cycleAlarmVolume);
     $('#alarm-ics').addEventListener('click', () => {
       if (alarm.current) downloadIcs(alarm.current, false);
     });
