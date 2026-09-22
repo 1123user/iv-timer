@@ -525,6 +525,93 @@ svg { width: 100%; height: 100%; display: block; }
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes pop { from { opacity: 0; transform: scale(0.94); } to { opacity: 1; transform: scale(1); } }
 
+/* ===================== 到点响铃（闹钟） ===================== */
+.alarm-root {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 22px;
+  background: rgba(15, 23, 42, 0.72);
+}
+.alarm-card {
+  width: 100%;
+  max-width: 340px;
+  padding: 24px 20px 18px;
+  border-radius: 20px;
+  background: var(--card);
+  text-align: center;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.35);
+  animation: pop 0.2s ease;
+}
+.alarm-bell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 58px;
+  height: 58px;
+  padding: 13px;
+  border-radius: 50%;
+  background: var(--destructive);
+  color: #fff;
+  animation: bell-pulse 1.1s ease-in-out infinite;
+}
+.alarm-kicker {
+  margin: 12px 0 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--destructive);
+}
+.alarm-title { margin: 4px 0 0; font-size: 21px; font-weight: 700; }
+.alarm-sub { margin: 4px 0 0; font-size: 12.5px; color: var(--muted-foreground); }
+
+.alarm-times { display: flex; gap: 10px; margin: 16px 0 18px; }
+.alarm-times > div {
+  flex: 1;
+  padding: 10px 6px;
+  border-radius: 12px;
+  background: var(--secondary);
+}
+.alarm-times strong { display: block; font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.alarm-times span { font-size: 11.5px; color: var(--muted-foreground); }
+
+.alarm-stop {
+  width: 100%;
+  padding: 15px;
+  border-radius: 13px;
+  background: var(--destructive);
+  color: var(--destructive-foreground);
+  font-size: 17px;
+  font-weight: 700;
+}
+.alarm-stop:active { background: var(--destructive-press); }
+
+.alarm-rows { display: flex; gap: 8px; margin-top: 10px; }
+.alarm-btn {
+  flex: 1;
+  padding: 11px 8px;
+  border-radius: 11px;
+  background: var(--secondary);
+  font-size: 13px;
+  font-weight: 500;
+}
+.alarm-btn:active { background: var(--muted); }
+
+.alarm-ics {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  text-decoration: underline;
+}
+
+@keyframes bell-pulse {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(213, 55, 44, 0.45); }
+  50% { transform: scale(1.06); box-shadow: 0 0 0 12px rgba(213, 55, 44, 0); }
+}
+
 /* ===================== 轻提示 ===================== */
 .toast-root {
   position: fixed;

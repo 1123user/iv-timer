@@ -43,7 +43,7 @@
             <path d="M18 8a6 6 0 1 0-12 0c0 6-2 7-2 7h16s-2-1-2-7" />
             <path d="M10.3 20a2 2 0 0 0 3.4 0" />
           </svg>
-          <span id="notify-text">开启推送</span>
+          <span id="notify-text">开启提醒</span>
         </button>
         <button type="button" class="ghost-btn" id="btn-help">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -208,6 +208,31 @@
     </main>
   </section>
 
+</div>
+
+<!-- ==================== 到点响铃（闹钟） ==================== -->
+<div class="alarm-root" id="alarm-root" hidden>
+  <div class="alarm-card" role="alertdialog" aria-modal="true" aria-labelledby="alarm-title">
+    <span class="alarm-bell" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 8a6 6 0 1 0-12 0c0 6-2 7-2 7h16s-2-1-2-7" />
+        <path d="M10.3 20a2 2 0 0 0 3.4 0" />
+      </svg>
+    </span>
+    <p class="alarm-kicker">参考时长已到</p>
+    <h2 class="alarm-title" id="alarm-title">—</h2>
+    <p class="alarm-sub" id="alarm-sub"></p>
+    <div class="alarm-times">
+      <div><strong class="num" id="alarm-elapsed">00:00</strong><span>已输注</span></div>
+      <div><strong class="num" id="alarm-over">00:00</strong><span>超出参考</span></div>
+    </div>
+    <button type="button" class="alarm-stop" id="alarm-stop">停止响铃</button>
+    <div class="alarm-rows">
+      <button type="button" class="alarm-btn" id="alarm-snooze">5 分钟后提醒</button>
+      <button type="button" class="alarm-btn" id="alarm-sound">铃声：经典闹钟</button>
+    </div>
+    <button type="button" class="alarm-ics" id="alarm-ics">导出日历提醒（后台兜底）</button>
+  </div>
 </div>
 
 <div class="picker-root" id="picker-root" hidden></div>

@@ -332,43 +332,70 @@
     } catch (e) { /* 部分浏览器需 ServiceWorker，忽略 */ }
   }
 
+  const ALARM_KEY = 'iv_alarm_pref';
+
+  function alarmPref() {
+    const raw = lsGet(ALARM_KEY, null);
+    return {
+      sound: raw && ALARM_SOUNDS[raw.sound] ? raw.sound : 'classic',
+      volume: raw && Number.isFinite(raw.volume) ? raw.volume : 0.6,
+    };
+  }
+
+  function setAlarmPref(patch) {
+    lsSet(ALARM_KEY, Object.assign(alarmPref(), patch));
+  }
+
+  /** 提醒就绪 = 通知已授权且音频已解锁（浏览器要求用户手势后才能出声） */
+  function alertReady() {
+    return notifyGranted() && !!audioCtx;
+  }
+
   function syncNotifyButton() {
     const btn = $('#btn-notify');
     const text = $('#notify-text');
     if (!btn) return;
-    btn.classList.toggle('is-on', notifyGranted());
+    const on = alertReady();
+    btn.classList.toggle('is-on', on);
     if (text) {
-      if (notifyGranted()) text.textContent = '推送已开启';
-      else if (notifySupported() && Notification.permission === 'denied') text.textContent = '推送已关闭';
-      else text.textContent = '开启推送';
+      if (on) text.textContent = '提醒已开启';
+      else if (notifySupported() && Notification.permission === 'denied') text.textContent = '通知被禁用';
+      else text.textContent = '开启提醒';
     }
   }
 
-  async function enablePush() {
+  /** 开启提醒：解锁音频（响铃）+ 申请系统通知权限 */
+  async function enableAlert() {
+    const ctx = ensureAudio();
+    if (!ctx) {
+      showToast('当前浏览器不支持铃声，将用震动 + 通知提醒');
+    } else {
+      playTone(ctx, 987.77, ctx.currentTime + 0.02, 0.2, 'sine', 0.5); // 试听一声，确认已解锁
+      vibrate(false);
+    }
+
     if (!notifySupported()) {
-      showToast('当前浏览器不支持系统通知，可用「到点提醒我」导入日历');
+      showToast('提醒已开启：到点会响铃提醒', true);
+      syncNotifyButton();
       return;
     }
     if (Notification.permission === 'granted') {
-      showToast('推送已开启', true);
+      showToast('提醒已开启：到点响铃 + 系统通知', true);
+      syncNotifyButton();
       return;
     }
     if (Notification.permission === 'denied') {
-      showToast('推送已被拒绝，请在浏览器设置中允许通知');
+      showToast('通知未授权，到点仍会响铃提醒');
+      syncNotifyButton();
       return;
     }
     try {
       const res = await Notification.requestPermission();
-      syncNotifyButton();
-      if (res === 'granted') {
-        vibrate(false);
-        showToast('推送已开启，到点会通知你', true);
-      } else {
-        showToast('未开启推送，可用「到点提醒我」导入日历');
-      }
+      showToast(res === 'granted' ? '提醒已开启：到点响铃 + 系统通知' : '通知未授权，到点仍会响铃提醒', res === 'granted');
     } catch (e) {
-      showToast('开启推送失败，可用「到点提醒我」导入日历');
+      showToast('通知未授权，到点仍会响铃提醒');
     }
+    syncNotifyButton();
   }
 
   /* ---------------- .ics 日历下载（照搬源码逻辑） ---------------- */
@@ -412,6 +439,207 @@
   }
 
   /* ============================================================
+   * 二.5、到点闹钟（应用内响铃）
+   * ------------------------------------------------------------
+   * - Web Audio 实时合成铃声，无需音频文件、无网络请求
+   * - 到点：循环响铃 + 震动 + 系统通知 + 全屏「停止响铃」面板
+   * - 响铃期间申请屏幕常亮（Wake Lock），避免锁屏后静默
+   * - 页面被系统挂起时（如 iOS 退到后台）不会响铃，这是网页版的
+   *   固有限制，因此保留 .ics 日历导出作为后台兜底
+   * ============================================================ */
+
+  const ALARM_SOUNDS = {
+    classic: { label: '经典闹钟', wave: 'square', dur: 0.14, gap: 1.3, seq: [880, 0, 880, 0, 880] },
+    ward: { label: '病房提示', wave: 'sine', dur: 0.34, gap: 1.6, seq: [659.25, 987.77] },
+    urgent: { label: '急促警报', wave: 'triangle', dur: 0.09, gap: 0.95, seq: [1318.5, 0, 1318.5] },
+  };
+  const ALARM_AUTO_STOP_MS = 120000; // 无人处理时 2 分钟自动停止
+
+  let audioCtx = null;
+  let masterGain = null;
+  let ringTimer = null;
+  let vibeTimer = null;
+  let wakeLock = null;
+
+  const alarm = { list: [], current: null, stopTimer: null, snooze: new Map(), volume: 0.6 };
+
+  function ensureAudio() {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    if (!audioCtx) {
+      audioCtx = new Ctx();
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = 1;
+      masterGain.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === 'suspended') {
+      const p = audioCtx.resume();
+      if (p && p.catch) p.catch(() => {});
+    }
+    return audioCtx;
+  }
+
+  function playTone(ctx, freq, at, dur, wave, vol) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = wave;
+    osc.frequency.setValueAtTime(freq, at);
+    gain.gain.setValueAtTime(0.0001, at);
+    gain.gain.exponentialRampToValueAtTime(Math.max(0.02, vol), at + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+    osc.connect(gain);
+    gain.connect(masterGain);
+    osc.start(at);
+    osc.stop(at + dur + 0.03);
+  }
+
+  /** 播放一组铃声（闹钟的「一遍」） */
+  function playRingBar(soundKey) {
+    const ctx = ensureAudio();
+    if (!ctx) return;
+    const s = ALARM_SOUNDS[soundKey] || ALARM_SOUNDS.classic;
+    const t0 = ctx.currentTime + 0.03;
+    s.seq.forEach((f, i) => {
+      if (f > 0) playTone(ctx, f, t0 + i * (s.dur + 0.07), s.dur, s.wave, 0.5 * alarm.volume);
+    });
+  }
+
+  function startRing(soundKey) {
+    stopRing();
+    const s = ALARM_SOUNDS[soundKey] || ALARM_SOUNDS.classic;
+    playRingBar(soundKey);
+    ringTimer = window.setInterval(() => playRingBar(soundKey), s.gap * 1000);
+  }
+
+  function stopRing() {
+    if (ringTimer) { window.clearInterval(ringTimer); ringTimer = null; }
+  }
+
+  function startVibe() {
+    stopVibe();
+    const loop = () => vibrate(true);
+    loop();
+    vibeTimer = window.setInterval(loop, 1600);
+  }
+
+  function stopVibe() {
+    if (vibeTimer) { window.clearInterval(vibeTimer); vibeTimer = null; }
+  }
+
+  async function acquireWakeLock() {
+    try {
+      if (!navigator.wakeLock || wakeLock) return;
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } catch (e) {
+      wakeLock = null;
+    }
+  }
+
+  function releaseWakeLock() {
+    try { if (wakeLock) wakeLock.release(); } catch (e) { /* 忽略 */ }
+    wakeLock = null;
+  }
+
+  /* ---------------- 响铃面板 ---------------- */
+
+  function renderAlarmPanel() {
+    const root = $('#alarm-root');
+    if (!root) return;
+    const task = alarm.current;
+    if (!task) {
+      root.hidden = true;
+      return;
+    }
+    const now = Date.now();
+    const elapsed = elapsedMs(task, now);
+    const over = Math.max(0, elapsed - task.expectedMin * 60 * 1000);
+    root.hidden = false;
+    $('#alarm-title').textContent = task.label;
+    $('#alarm-sub').textContent = '参考时长 ' + task.expectedMin + ' 分钟 · 到点提醒';
+    $('#alarm-elapsed').textContent = fmtDuration(elapsed);
+    $('#alarm-over').textContent = over > 0 ? fmtDuration(over) : '00:00';
+    const s = ALARM_SOUNDS[alarmPref().sound] || ALARM_SOUNDS.classic;
+    $('#alarm-sound').textContent = '铃声：' + s.label;
+  }
+
+  function nextAlarm() {
+    alarm.current = alarm.list.shift() || null;
+    if (!alarm.current) {
+      stopRing();
+      stopVibe();
+      releaseWakeLock();
+      renderAlarmPanel();
+      return;
+    }
+    const pref = alarmPref();
+    alarm.volume = pref.volume;
+    startRing(pref.sound);
+    startVibe();
+    acquireWakeLock();
+    renderAlarmPanel();
+    pushNotify('🔔 到点提醒', alarm.current.label + ' 参考时长已到，请查看输注情况');
+    if (alarm.stopTimer) window.clearTimeout(alarm.stopTimer);
+    alarm.stopTimer = window.setTimeout(stopAlarm, ALARM_AUTO_STOP_MS);
+  }
+
+  /** 触发响铃（已在响的任务不会重复入队） */
+  function startAlarm(task) {
+    if (!task) return;
+    if (alarm.current && alarm.current.id === task.id) return;
+    if (alarm.list.some((t) => t.id === task.id)) return;
+    alarm.list.push(task);
+    if (!alarm.current) nextAlarm();
+  }
+
+  function stopAlarm() {
+    if (alarm.stopTimer) { window.clearTimeout(alarm.stopTimer); alarm.stopTimer = null; }
+    stopRing();
+    stopVibe();
+    if (alarm.list.length > 0) { nextAlarm(); return; }
+    alarm.current = null;
+    releaseWakeLock();
+    renderAlarmPanel();
+  }
+
+  function snoozeAlarm(minutes) {
+    const task = alarm.current;
+    if (!task) return;
+    alarm.snooze.set(task.id, Date.now() + minutes * 60 * 1000);
+    showToast('已设为 ' + minutes + ' 分钟后再次响铃');
+    stopAlarm();
+  }
+
+  function cycleAlarmSound() {
+    const keys = Object.keys(ALARM_SOUNDS);
+    const cur = alarmPref().sound;
+    const next = keys[(keys.indexOf(cur) + 1) % keys.length];
+    setAlarmPref({ sound: next });
+    alarm.volume = alarmPref().volume;
+    playRingBar(next); // 立即试听
+    renderAlarmPanel();
+    showToast('铃声：' + ALARM_SOUNDS[next].label);
+  }
+
+  /** 贪睡未到期时不再自动响铃 */
+  function snoozeReady(task) {
+    const at = alarm.snooze.get(task.id);
+    if (!at) return true;
+    if (Date.now() >= at) {
+      alarm.snooze.delete(task.id);
+      return true;
+    }
+    return false;
+  }
+
+  /** 任务结束 / 删除时清理它的闹钟状态 */
+  function clearAlarmFor(id) {
+    alarm.list = alarm.list.filter((t) => t.id !== id);
+    alarm.snooze.delete(id);
+    if (alarm.current && alarm.current.id === id) stopAlarm();
+  }
+
+  /* ============================================================
    * 三、监护台视图
    * ============================================================ */
 
@@ -422,7 +650,8 @@
     tab: 'active',
     page: 0,
     expandId: null,
-    alerted: new Set(),
+    alerted: new Set(), // 提前提醒（每个任务一次）
+    ringed: new Set(),  // 到点响铃（每个任务一次，重新开始计时会重置）
   };
 
   const ICON_CHEVRON_DOWN =
@@ -653,6 +882,9 @@
       return;
     }
     vibrate(true);
+    // 重新开始计时：重置该任务的提醒状态
+    state.ringed.delete(result.id);
+    state.alerted.delete('pre:' + result.id);
     const willFinishAt = result.startTs + result.expectedMin * 60 * 1000;
     await showModal({
       title: '✅ 已开始输注',
@@ -680,6 +912,7 @@
       return;
     }
     vibrate(true);
+    clearAlarmFor(result.id); // 结束输液即停止该任务的响铃
     // 任务结束后：日历提醒视为完成，自动生成取消文件删除对应提醒
     downloadIcs(result, true);
     await showModal({
@@ -702,6 +935,7 @@
       tone: 'danger',
     });
     if (!ok) return;
+    clearAlarmFor(task.id);
     removeTask(task.id);
     if (state.expandId === task.id) state.expandId = null;
     renderMonitor();
@@ -711,10 +945,13 @@
     showModal({
       title: '使用说明',
       content:
-        '1. 点底部「+ 新增特殊药品」，输入药名（勿填患者姓名）\n' +
-        '2. 填总量和滴速可自动算参考时长\n' +
-        '3. 开始输液按「开始输液」，输完按「结束输液」\n' +
-        '4. 展开卡片点「到点提醒我」，导入手机日历后锁屏也能提醒\n' +
+        '1. 先点右上角「开启提醒」，解锁响铃与通知权限（只需一次）\n' +
+        '2. 点底部「+ 新增特殊药品」，选择或输入药名（勿填患者姓名）\n' +
+        '3. 选中规范库药品后，会按当前含量给出参照输注时间\n' +
+        '4. 按「开始输液」计时；参考时长到点后会像闹钟一样响铃，\n' +
+        '   响铃页可「停止响铃」「5 分钟后提醒」、或点「铃声」切换音色\n' +
+        '5. 保持本页面在前台（或从主屏幕图标打开）响铃最可靠；\n' +
+        '   长时间离开时可点「到点提醒我」导出日历做后台兜底\n' +
         '预计时长仅供参考，可随时结束。',
       confirmText: '知道了',
       showCancel: false,
@@ -735,8 +972,16 @@
       renderMonitor();
     });
 
-    $('#btn-notify').addEventListener('click', enablePush);
+    $('#btn-notify').addEventListener('click', enableAlert);
     $('#btn-help').addEventListener('click', showHelp);
+
+    // 响铃面板
+    $('#alarm-stop').addEventListener('click', stopAlarm);
+    $('#alarm-snooze').addEventListener('click', () => snoozeAlarm(5));
+    $('#alarm-sound').addEventListener('click', cycleAlarmSound);
+    $('#alarm-ics').addEventListener('click', () => {
+      if (alarm.current) downloadIcs(alarm.current, false);
+    });
     $('#btn-add').addEventListener('click', () => { location.hash = '#/add'; });
 
     $('#pager').addEventListener('click', (e) => {
@@ -1295,23 +1540,33 @@
     else renderMonitor();
   }
 
-  /** 秒级刷新 + 参考提醒（预计时间仅供参考，每瓶只提醒一次，不做严格限制） */
+  /** 秒级刷新 + 提前提醒 + 到点响铃（预计时间仅供参考，每瓶只提醒一次） */
   function tick() {
     updateLive();
     const t = Date.now();
+
     for (const task of state.tasks) {
       if (task.status !== 'running') continue;
       const rem = remainingMs(task, t);
-      if (rem <= task.alertMin * 60 * 1000 && !state.alerted.has(task.id)) {
-        state.alerted.add(task.id);
+
+      // ① 提前提醒：轻提示（不响铃）
+      const preKey = 'pre:' + task.id;
+      if (rem > 0 && rem <= task.alertMin * 60 * 1000 && !state.alerted.has(preKey)) {
+        state.alerted.add(preKey);
         vibrate(false);
-        const msg = rem <= 0
-          ? task.label + ' 已超参考时长 ' + fmtHuman(-rem)
-          : task.label + ' 参考剩余约 ' + fmtHuman(rem);
+        const msg = task.label + ' 参考剩余约 ' + fmtHuman(rem);
         showToast('🔔 ' + msg);
         pushNotify('🔔 输注提醒', msg);
       }
+
+      // ② 到点闹钟：循环响铃 + 震动 + 全屏「停止响铃」
+      if (rem <= 0 && !state.ringed.has(task.id) && snoozeReady(task)) {
+        state.ringed.add(task.id);
+        startAlarm(task);
+      }
     }
+
+    if (alarm.current) renderAlarmPanel(); // 响铃面板时间每秒走动
   }
 
   /**
@@ -1321,28 +1576,39 @@
   function catchUp() {
     reload();
     const t = Date.now();
-    const missed = state.tasks.filter((task) => {
-      if (task.status !== 'running') return false;
+    const missed = [];
+
+    for (const task of state.tasks) {
+      if (task.status !== 'running') continue;
       const rem = remainingMs(task, t);
-      const hit = rem <= task.alertMin * 60 * 1000;
-      if (hit) state.alerted.add(task.id);
-      return hit;
-    });
+
+      const preKey = 'pre:' + task.id;
+      if (rem <= task.alertMin * 60 * 1000 && !state.alerted.has(preKey)) {
+        state.alerted.add(preKey);
+        missed.push(rem <= 0
+          ? task.label + ' 已超参考时长 ' + fmtHuman(-rem)
+          : task.label + ' 参考剩余约 ' + fmtHuman(rem));
+      }
+
+      // 离开期间已到点的：回到页面立即响铃
+      if (rem <= 0 && !state.ringed.has(task.id) && snoozeReady(task)) {
+        state.ringed.add(task.id);
+        startAlarm(task);
+      }
+    }
+
     if (missed.length > 0) {
       vibrate(true);
-      const lines = missed.map((task) => {
-        const rem = remainingMs(task, t);
-        return rem <= 0
-          ? task.label + ' 已超参考时长 ' + fmtHuman(-rem)
-          : task.label + ' 参考剩余约 ' + fmtHuman(rem);
-      });
-      pushNotify('🔔 输注提醒', lines.join('\n'));
-      showModal({
-        title: '🔔 输注提醒',
-        content: lines.join('\n'),
-        confirmText: '知道了',
-        showCancel: false,
-      });
+      pushNotify('🔔 输注提醒', missed.join('\n'));
+      // 已在响铃时不再叠加弹窗，避免遮挡「停止响铃」
+      if (!alarm.current) {
+        showModal({
+          title: '🔔 输注提醒',
+          content: missed.join('\n'),
+          confirmText: '知道了',
+          showCancel: false,
+        });
+      }
     }
   }
 
@@ -1361,6 +1627,10 @@
         const isAdd = location.hash.indexOf('#/add') === 0;
         if (!isAdd) renderMonitor();
         catchUp();
+        if (alarm.current) {
+          acquireWakeLock(); // 切回前台重新申请亮屏，避免响铃中被锁屏
+          renderAlarmPanel();
+        }
       }
     });
 
